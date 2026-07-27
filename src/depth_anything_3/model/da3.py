@@ -155,27 +155,50 @@ class DepthAnything3Net(nn.Module):
     def _process_mono_sky_estimation(
         self, output: Dict[str, torch.Tensor]
     ) -> Dict[str, torch.Tensor]:
-        """Process mono sky estimation."""
+        """Process mono sky estimation.
+
+        Uses ``torch.where``-based branching so the graph remains traceable by
+        ``torch.export.export`` / ``torch.onnx.export``.
+        """
         if "sky" not in output:
             return output
-        non_sky_mask = compute_sky_mask(output.sky, threshold=0.3)
-        if non_sky_mask.sum() <= 10:
-            return output
-        if (~non_sky_mask).sum() <= 10:
-            return output
-        
-        non_sky_depth = output.depth[non_sky_mask]
-        if non_sky_depth.numel() > 100000:
-            idx = torch.randint(0, non_sky_depth.numel(), (100000,), device=non_sky_depth.device)
-            sampled_depth = non_sky_depth[idx]
-        else:
-            sampled_depth = non_sky_depth
-        non_sky_max = torch.quantile(sampled_depth, 0.99)
 
-        # Set sky regions to maximum depth and high confidence
-        output.depth, _ = set_sky_regions_to_max_depth(
+        non_sky_mask = compute_sky_mask(output.sky, threshold=0.3)
+
+        # Compute conditions as tensors instead of Python bools so the tracer
+        # can record them without evaluating data-dependent guards.
+        n_non_sky = non_sky_mask.sum()          # scalar tensor
+        n_sky = (~non_sky_mask).sum()           # scalar tensor
+        should_apply = (n_non_sky > 10) & (n_sky > 10)
+
+        # ---- always-computed sky-processing path --------------------------------
+        non_sky_depth = output.depth[non_sky_mask]
+
+        # Deterministic sub-sampling: take at most 100k elements (the leading
+        # 100k after flattening is a reasonable proxy for ``torch.randint``).
+        flat_depth = non_sky_depth.flatten()
+        sampled_depth = flat_depth[:100000]
+
+        # Guard ``quantile`` against a (rare) empty tensor by appending a single
+        # zero.  When the tensor is non-empty the extra zero does not affect the
+        # 0.99-quantile in a meaningful way; when empty we get a harmless 0.0.
+        safe_sampled = torch.cat(
+            [
+                sampled_depth,
+                torch.zeros(1, device=sampled_depth.device, dtype=sampled_depth.dtype),
+            ]
+        )
+        non_sky_max = torch.quantile(safe_sampled, 0.99)
+
+        processed_depth, _ = set_sky_regions_to_max_depth(
             output.depth, None, non_sky_mask, max_depth=non_sky_max
         )
+        # ------------------------------------------------------------------------
+
+        # Select between processed and original depth based on whether the masks
+        # contain enough pixels of both classes.
+        output.depth = torch.where(should_apply, processed_depth, output.depth)
+
         return output
 
     def _process_ray_pose_estimation(

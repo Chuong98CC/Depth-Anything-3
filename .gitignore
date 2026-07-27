@@ -33,4 +33,6 @@ input_images*/
 src/debug_main.py
 src/outputs
 temp*.png
-/outputs
+/output
+*.onnx
+data/
