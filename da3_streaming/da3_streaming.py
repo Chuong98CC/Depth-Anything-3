@@ -140,9 +140,10 @@ class DA3_Streaming:
         self.conf_threshold = 1.5
         self.seed = 42
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.dtype = (
-            torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-        )
+        # self.dtype = (
+        #     torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+        # )
+        self.dtype = torch.float16
 
         self.img_dir = image_dir
         self.img_list = None

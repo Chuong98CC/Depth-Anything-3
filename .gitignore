@@ -35,4 +35,6 @@ src/outputs
 temp*.png
 /output
 *.onnx
-data/
+*.onnx.data
+*.engine
+data

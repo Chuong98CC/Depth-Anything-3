@@ -10,11 +10,16 @@ def get_args_parser():
     return parser
 
 def main(args):
-    weight_folder = os.path.dirname(args.onnx_path)
-    base_name = os.path.basename(args.onnx_path)
-    trt_path = args.trt_path if args.trt_path else os.path.join(weight_folder, f'trt_save')
-    os.makedirs(trt_path, exist_ok=True)
-    trt_file_path = os.path.join(trt_path, f'{os.path.splitext(base_name)[0]}_{args.precision}.engine')
+    if not os.path.exists(args.onnx_path):
+        raise FileNotFoundError(f"ONNX file not found: {args.onnx_path}")
+    if args.trt_path is None:
+        weight_folder = os.path.dirname(args.onnx_path)
+        base_name = os.path.basename(args.onnx_path)
+        trt_file_path = os.path.join(weight_folder, f'{os.path.splitext(base_name)[0]}_{args.precision}.engine')
+    else:
+        trt_file_path = args.trt_path
+        trt_path = os.path.dirname(trt_file_path)
+        os.makedirs(trt_path, exist_ok=True)
 
     command = f'trtexec --onnx={args.onnx_path} --saveEngine={trt_file_path}'
 

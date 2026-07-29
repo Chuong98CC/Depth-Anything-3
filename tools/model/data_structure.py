@@ -133,7 +133,7 @@ class CameraIntrinsics:
         else:
             w, h = 0, 0
         return CameraIntrinsics(fx=fx, fy=fy, cx=cx, cy=cy, bl=baseline, w=w, h=h)
-    
+
     @staticmethod
     def from_calib_file(calib_file: str, camera: str = "head_stereo_left", baseline_cams: str = "head_stereo_left->head_stereo_right") -> "CameraIntrinsics":
         cam = read_calib_file(calib_file)
@@ -168,6 +168,21 @@ class CameraIntrinsics:
     def cy_scaled(self, resize_h: int):
         return self.cy * resize_h / self.h
 
+    def scaled_params(self, resize_w: int, resize_h: int):
+        if resize_h and resize_w:
+            fx = self.fx_scaled(resize_w)
+            fy = self.fy_scaled(resize_h)
+            cx = self.cx_scaled(resize_w)
+            cy = self.cy_scaled(resize_h)
+        else:
+            fx, fy, cx, cy = self.fx, self.fy, self.cx, self.cy
+        return fx,fy,cx,cy
+
+    def intrinsic(self, resize_h: int=None, resize_w: int=None):
+        """Return the 3x3 intrinsic matrix, optionally scaled to a different resolution."""
+        fx, fy, cx, cy = self.scaled_params(resize_w, resize_h)
+        return np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
+
     def disparity_to_depth(self, disparity: np.ndarray, resize_w: int = None, resize_h: int = None, mask: np.ndarray = None) -> np.ndarray:
         """Convert disparity map to depth map using the formula: depth = (f * bl) / disparity."""
         with np.errstate(divide="ignore"):
@@ -184,7 +199,7 @@ class CameraIntrinsics:
 
         return depth
 
-    def back_project(self, uv: np.ndarray, depth: np.ndarray, resize_w: int, resize_h: int) -> np.ndarray:
+    def back_project(self, uv: np.ndarray, depth: np.ndarray, resize_w: int=None, resize_h: int=None) -> np.ndarray:
         """Back-project 2D pixel coordinates (u, v) with depth to 3D points.
 
         ``uv`` and ``depth`` are expressed in a ``resize_w × resize_h`` image
@@ -196,16 +211,15 @@ class CameraIntrinsics:
         """
         u = uv[:, 0]
         v = uv[:, 1]
-        fx = self.fx_scaled(resize_w)
-        fy = self.fy_scaled(resize_h)
-        cx = self.cx_scaled(resize_w)
-        cy = self.cy_scaled(resize_h)
+
+        fx, fy, cx, cy = self.scaled_params(resize_w, resize_h)
+
         x = (u - cx) * depth / fx
         y = (v - cy) * depth / fy
         z = depth
         return np.stack((x, y, z), axis=-1)
 
-    def forward_project(self, xyz: np.ndarray, resize_w: int, resize_h: int) -> np.ndarray:
+    def forward_project(self, xyz: np.ndarray, resize_w: int=None, resize_h: int=None) -> np.ndarray:
         """Forward-project 3D points to 2D pixel coordinates (u, v).
 
         Coordinates are returned in a ``resize_w × resize_h`` image, using the
@@ -214,9 +228,11 @@ class CameraIntrinsics:
         x = xyz[:, 0]
         y = xyz[:, 1]
         z = np.clip(xyz[:, 2], 1e-6, None)  # guard against divide-by-zero
-        u = (x * self.fx_scaled(resize_w)) / z + self.cx_scaled(resize_w)
-        v = (y * self.fy_scaled(resize_h)) / z + self.cy_scaled(resize_h)
+        fx, fy, cx, cy = self.scaled_params(resize_w, resize_h)
+        u = (x * fx) / z + cx
+        v = (y * fy) / z + cy
         return np.stack((u, v), axis=-1)
+
 
 @dataclass(slots=True)
 class CameraExtrinsics:
