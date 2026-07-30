@@ -85,10 +85,15 @@ defaults to `<onnx_dir>/<onnx_stem>_<precision>.engine`.
 | `--trt_path` | `None` | Output engine path (auto-derived if omitted) |
 | `--precision` | `fp16` | `fp16`, `tf32`, or `fp32` |
 
+Basic usage
 ```bash
 python tools/export_trt.py weights/da3_anyview_n3_644x490.onnx --precision fp16
 ```
-
+To avoid environment set-up headache, please use the `tools/scripts/export_trt_docker.sh` instead,
+To inference the TRT model, install the matching TRT version in your python env by:
+```bash
+pip install tensorrt-cu12==10.16.1.11
+```
 ---
 
 ## Inference
@@ -132,6 +137,7 @@ matching the PyTorch output fields (depth, depth_conf, extrinsics, intrinsics).
 | `--onnx-metric` | `weights/da3_metric_644x490_giant-large-1.1.onnx` | Metric ONNX path |
 | `--export-dir` | `output_onnx` | Directory to save `result.npz` per frame |
 | `--device` | `cuda` | ONNX Runtime device |
+| `--no-align-input-ext-scale` | off (alignment on) | Disable the Umeyama alignment of the prediction to the input camera poses. On by default, matching `DepthAnything3.inference(align_to_input_ext_scale=True)`; when enabled, output extrinsics are the input poses and depth is rescaled to the input pose scale. |
 
 ```bash
 python tools/infer_onnx_nested.py --camera-set set1 --frame 0

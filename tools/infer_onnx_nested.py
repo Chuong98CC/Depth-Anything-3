@@ -35,7 +35,7 @@ _TOOLS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_TOOLS_DIR))
 
 from astribot_dataloader import CAMERA_SETS, count_frames, load_images_cam_params  # noqa: E402
-from model.alignment import align_anyview_with_metric  # noqa: E402
+from model.alignment import align_anyview_with_metric, align_to_input_ext_scale  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Default ONNX model paths
@@ -123,8 +123,17 @@ class NestedONNXInference:
         image_paths: list[str],
         extrs: np.ndarray,
         intrs: np.ndarray,
+        align_input_ext_scale: bool = True,
     ) -> dict[str, np.ndarray]:
         """Run the full nested ONNX pipeline.
+
+        Parameters
+        ----------
+        align_input_ext_scale : bool, default ``True``
+            Align the prediction to the input camera poses via Umeyama Sim(3)
+            (numpy post-processing, mirrors ``align_to_input_ext_scale=True`` in
+            ``DepthAnything3.inference``).  When ``True`` the output extrinsics are
+            the input poses and depth is rescaled to the input pose scale.
 
         Returns
         -------
@@ -200,6 +209,20 @@ class NestedONNXInference:
             if val.ndim >= 4 and val.shape[0] == 1:
                 val = val.squeeze(0)
             result[k] = val
+
+        # ---- 5. Align to input camera poses (numpy post-processing) -------
+        if align_input_ext_scale:
+            aligned_in = align_to_input_ext_scale(
+                pred_depth=result["depth"],
+                pred_extrinsics=result["extrinsics"],
+                input_extrinsics=extrs,       # raw, un-normalised input poses
+                input_intrinsics=intrs_adj,   # scaled to processing resolution
+                align_scale=True,
+            )
+            result["depth"] = aligned_in["depth"]
+            result["extrinsics"] = aligned_in["extrinsics"]
+            result["intrinsics"] = aligned_in["intrinsics"]
+
         return result
 
 
@@ -291,6 +314,13 @@ def main() -> None:
         "--device", default="cuda", choices=["cuda", "cpu"],
         help="ONNX Runtime device.",
     )
+    parser.add_argument(
+        "--no-align-input-ext-scale", dest="align_input_ext_scale",
+        action="store_false",
+        help="Disable Umeyama alignment of the prediction to the input camera "
+             "poses (on by default, matching DepthAnything3.inference).",
+    )
+    parser.set_defaults(align_input_ext_scale=True)
     args = parser.parse_args()
 
     # --- Determine frame range ---
@@ -319,7 +349,10 @@ def main() -> None:
         for p in images:
             print(f"    {p}")
 
-        result = pipeline.infer(images, exts, ixts)
+        result = pipeline.infer(
+            images, exts, ixts,
+            align_input_ext_scale=args.align_input_ext_scale,
+        )
 
         print(f"  depth shape:      {result['depth'].shape}")
         print(f"  depth_conf shape: {result['depth_conf'].shape}")

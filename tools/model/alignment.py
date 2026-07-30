@@ -7,6 +7,7 @@ the ONNX / TRT graph.
 
 from __future__ import annotations
 
+import numpy as np
 import torch
 
 
@@ -100,4 +101,69 @@ def align_anyview_with_metric(
         "depth_conf": anyview_conf,
         "extrinsics": anyview_extrinsics,
         "intrinsics": anyview_intrinsics,
+    }
+
+
+def align_to_input_ext_scale(
+    pred_depth: np.ndarray,
+    pred_extrinsics: np.ndarray,
+    input_extrinsics: np.ndarray,
+    input_intrinsics: np.ndarray,
+    align_scale: bool = True,
+    ransac_view_thresh: int = 10,
+) -> dict[str, np.ndarray]:
+    """Align a prediction to the input camera poses (numpy post-processing).
+
+    Standalone replica of ``DepthAnything3._align_to_input_extrinsics_intrinsics``
+    (``api.py``) so it can run **outside** the ONNX / TRT graph, on the outputs of
+    :func:`align_anyview_with_metric`.  The Umeyama Sim(3) scale it needs (3x3 SVD,
+    optional RANSAC via ``evo``) is not ONNX-exportable, hence the Python helper.
+
+    Parameters
+    ----------
+    pred_depth : ``(N, H, W)``
+        Predicted (metric-scaled) depth from the nested pipeline.
+    pred_extrinsics : ``(N, 3, 4)`` or ``(N, 4, 4)``
+        Predicted camera extrinsics (world-to-camera), in the model's frame.
+    input_extrinsics : ``(N, 4, 4)``
+        Original **un-normalised** input extrinsics (world-to-camera).
+    input_intrinsics : ``(N, 3, 3)``
+        Input intrinsics, scaled to the processing resolution.  Passed straight
+        through to the output (mirrors the PyTorch behaviour).
+    align_scale : bool, default ``True``
+        If ``True``: output extrinsics are the input extrinsics and ``depth`` is
+        divided by the Umeyama scale.  If ``False``: output extrinsics are the
+        predicted poses aligned into the input frame, and depth is unchanged.
+    ransac_view_thresh : int, default 10
+        Use RANSAC alignment when the number of views is ``>=`` this threshold.
+
+    Returns
+    -------
+    dict[str, np.ndarray]
+        ``depth``, ``extrinsics`` ``(N, 3, 4)``, ``intrinsics``.
+    """
+    from depth_anything_3.utils.pose_align import align_poses_umeyama  # noqa: PLC0415
+
+    pred_extrinsics = np.asarray(pred_extrinsics, dtype=np.float64)
+    input_extrinsics = np.asarray(input_extrinsics, dtype=np.float64)
+
+    _, _, scale, aligned_extrinsics = align_poses_umeyama(
+        pred_extrinsics,
+        input_extrinsics,
+        ransac=len(input_extrinsics) >= ransac_view_thresh,
+        return_aligned=True,
+        random_state=42,
+    )
+
+    out_depth = np.asarray(pred_depth).copy()
+    if align_scale:
+        out_extrinsics = input_extrinsics[..., :3, :].copy()
+        out_depth = out_depth / scale
+    else:
+        out_extrinsics = aligned_extrinsics[..., :3, :]
+
+    return {
+        "depth": out_depth.astype(np.float32),
+        "extrinsics": out_extrinsics.astype(np.float32),
+        "intrinsics": np.asarray(input_intrinsics, dtype=np.float32).copy(),
     }
