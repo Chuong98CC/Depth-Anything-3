@@ -31,7 +31,7 @@ _TOOLS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_TOOLS_DIR))
 
 from astribot_dataloader import CAMERA_SETS, count_frames, load_images_cam_params  # noqa: E402
-from model.da3nested_onnx import DA3NestedONNX  # noqa: E402
+from model.da3nested import DA3NestedONNX  # noqa: E402
 
 DEFAULT_ANYVIEW_ONNX = "weights/da3_anyview_n3_644x490_giant-large-1.1.onnx"
 DEFAULT_METRIC_ONNX = "weights/da3_metric_644x490_giant-large-1.1.onnx"

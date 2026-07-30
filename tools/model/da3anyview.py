@@ -1,8 +1,8 @@
-"""Depth Anything v3 any-view TensorRT wrapper.
+"""Depth Anything v3 any-view wrappers (TensorRT + ONNX).
 
-Multi-view depth + confidence + predicted camera parameters.  Built on
-``TRTModel`` (engine) + ``BaseDA3Model`` (pre/post) — the TRT sibling of
-``DA3AnyViewONNX``.
+Multi-view depth + confidence + predicted camera parameters.  Both wrappers
+share ``BaseDA3Model`` (pre/post); ``DA3AnyViewModel`` runs a TensorRT engine
+(``TRTModel``) and ``DA3AnyViewONNX`` runs an ONNX session (``ONNXModel``).
 """
 
 from __future__ import annotations
@@ -10,6 +10,7 @@ from __future__ import annotations
 import numpy as np
 
 from model.base_da3 import BaseDA3Model
+from model.base_onnx import ONNXModel
 from model.base_trt import TRTModel
 
 
@@ -39,6 +40,36 @@ class DA3AnyViewModel(TRTModel, BaseDA3Model):
         img_batch, intrs_adj, _ = self.preprocess_views(imgs, intrs)
         ext = self.normalize_extrinsics(extrs) if normalize_extrinsics else extrs
         raw = self._run(
+            {
+                "image": img_batch.astype(np.float32),
+                "extrinsics": ext[None].astype(np.float32),
+                "intrinsics": intrs_adj[None].astype(np.float32),
+            }
+        )
+        return self.map_anyview_keys(raw)
+
+
+class DA3AnyViewONNX(ONNXModel, BaseDA3Model):
+    """Any-view ONNX inference: images (+ extrinsics/intrinsics) → depth bundle."""
+
+    def infer(
+        self,
+        imgs: list,
+        extrs: np.ndarray,
+        intrs: np.ndarray,
+        *,
+        normalize_extrinsics: bool = False,
+    ) -> dict:
+        """Run the any-view model.
+
+        ``imgs`` are *N* paths or BGR arrays; ``extrs`` ``(N,4,4)``; ``intrs``
+        ``(N,3,3)`` at original resolution.  Returns the mapped output dict with
+        batched values (``(1,N,…)``).  Extrinsics are normalized here only when
+        ``normalize_extrinsics=True`` (the ONNX graph does not normalize).
+        """
+        img_batch, intrs_adj, _ = self.preprocess_views(imgs, intrs)
+        ext = self.normalize_extrinsics(extrs) if normalize_extrinsics else extrs
+        raw = self.run(
             {
                 "image": img_batch.astype(np.float32),
                 "extrinsics": ext[None].astype(np.float32),
