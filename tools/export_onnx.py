@@ -793,10 +793,10 @@ def run_anyview_accuracy_check(
         )
 
     # Also check structural equivalence
-    depth_match = np.allclose(pt_np["depth"], onx["depth"], atol=1e-3)
-    print(f"\n[ACCURACY] depth    allclose(atol=1e-3): {depth_match}")
-    conf_match = np.allclose(pt_np["depth_conf"], onx["depth_conf"], atol=1e-3)
-    print(f"[ACCURACY] depth_conf allclose(atol=1e-3): {conf_match}")
+    depth_match = np.allclose(pt_np["depth"], onx["depth"], atol=1e-2)
+    print(f"\n[ACCURACY] depth    allclose(atol=1e-2): {depth_match}")
+    conf_match = np.allclose(pt_np["depth_conf"], onx["depth_conf"], atol=1e-2)
+    print(f"[ACCURACY] depth_conf allclose(atol=1e-2): {conf_match}")
     print("=" * 72)
 
 

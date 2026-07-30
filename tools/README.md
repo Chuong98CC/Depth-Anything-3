@@ -164,22 +164,24 @@ python tools/infer_onnx_metric_depth.py \
 ### `compare_nested_onnx_pt.py`
 
 Compare the end-to-end PyTorch nested model against the split-ONNX pipeline
-(any-view ONNX + metric ONNX + `align_anyview_with_metric`) on Astribot set1 /
-frame 0. Reports per-output absolute / relative error and `allclose` checks.
+(any-view ONNX + metric ONNX + `align_anyview_with_metric`) on a selectable
+Astribot camera set / frame. Runs on CUDA; the target H/W is read from the
+any-view ONNX model. Reports per-output absolute / relative error and `allclose`
+checks.
 
 | Argument | Default | Description |
 |---|---|---|
 | `--model-dir` | `depth-anything/DA3NESTED-GIANT-LARGE-1.1` | PyTorch nested checkpoint (HuggingFace id or local dir) |
-| `--onnx-anyview` | *required* | Any-view ONNX path |
+| `--onnx-anyview` | *required* | Any-view ONNX path (its input H/W sets the target size) |
 | `--onnx-metric` | *required* | Metric ONNX path |
-| `--device` | `cuda` | Device for PyTorch / ONNX Runtime |
-| `--height` | `490` | Target height (must match ONNX inputs) |
-| `--width` | `644` | Target width (must match ONNX inputs) |
+| `--camera-set` | `set0` | Astribot camera set (`set0`/`set1`/`set2`; view count must match the any-view export) |
+| `--frame-idx` | `0` | Frame index to load (0-based) |
 
 ```bash
 python tools/compare_nested_onnx_pt.py \
     --onnx-anyview weights/da3_anyview_n3_644x490_giant-large-1.1.onnx \
-    --onnx-metric  weights/da3_metric_644x490_giant-large-1.1.onnx
+    --onnx-metric  weights/da3_metric_644x490_giant-large-1.1.onnx \
+    --camera-set set0 --frame-idx 0
 ```
 
 ### `compare_onnx_trt.py`
