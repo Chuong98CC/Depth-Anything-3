@@ -28,13 +28,6 @@ from model.alignment import align_anyview_with_metric
 from astribot_dataloader import load_images_cam_params
 
 # ---------------------------------------------------------------------------
-# Data loading (mirrors astribot_dataloader)
-# ---------------------------------------------------------------------------
-
-
-
-
-# ---------------------------------------------------------------------------
 # Common preprocessing (exact resize, same as any-view ONNX / TRT)
 # ---------------------------------------------------------------------------
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
@@ -282,7 +275,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Compare PyTorch nested model vs split ONNX pipeline",
     )
-    parser.add_argument("--model-dir", required=True, type=str,
+    parser.add_argument("--model-dir", type=str,
+                        default="depth-anything/DA3NESTED-GIANT-LARGE-1.1",
                         help="PyTorch nested model checkpoint (HuggingFace ID or local dir).")
     parser.add_argument("--onnx-anyview", required=True, type=str,
                         help="Path to any-view ONNX model.")

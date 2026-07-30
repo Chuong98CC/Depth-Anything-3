@@ -53,7 +53,7 @@ def main():
              "Use --all-frames to process all common frames.",
     )
     parser.add_argument(
-        "--model-name", default="depth-anything/DA3-SMALL",
+        "--model-name", default="depth-anything/DA3NESTED-GIANT-LARGE-1.1",
         help="Model name or HuggingFace Hub ID",
     )
     parser.add_argument(

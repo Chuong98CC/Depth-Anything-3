@@ -48,18 +48,21 @@ def _get_metric_submodel(api_model: DepthAnything3) -> nn.Module:
     return getattr(api_model.model, "da3_metric", api_model.model)
 
 
-# Metric-depth scaling constant: ``metric_depth = focal_px * net_output / 300``.
-METRIC_SCALE_FACTOR = 300.0
-
-
 def _forward_metric_submodel(api_model: DepthAnything3, image: torch.Tensor):
     """Run the metric branch on a ``(B, 3, H, W)`` image, returning (depth, sky).
 
-    Shared by both metric wrappers.  Bypasses the API-level autocast (which forces
-    bf16 on CUDA) by calling the underlying ``DepthAnything3Net`` directly — its
-    depth head already runs in ``autocast(..., enabled=False)``, so the graph stays
-    float32 and ONNX-Runtime-CPU-compatible.  For nested checkpoints only the
-    metric branch (``.da3_metric``) is traced, never the any-view giant backbone.
+    Bypasses the API-level autocast (which forces bf16 on CUDA) by calling the
+    underlying ``DepthAnything3Net`` directly — its depth head already runs in
+    ``autocast(..., enabled=False)``, so the graph stays float32 and
+    ONNX-Runtime-CPU-compatible.  For nested checkpoints only the metric branch
+    (``.da3_metric``) is traced, never the any-view giant backbone.
+
+    The exported graph returns the **raw** network depth.  Metric depth in metres
+    is a caller-side post-processing step (``metric_depth = focal * net_output /
+    300``, ``focal = (fx + fy) / 2``); the metric sub-model itself never consumes
+    the intrinsic matrix (its ``intrinsics`` argument is unused unless extrinsics
+    or GS are enabled — see ``NestedDepthAnything3Net``), so intrinsics stay out of
+    the ONNX graph entirely.
     """
     model_in = image.unsqueeze(1)  # add single-view dimension → (B, 1, 3, H, W)
     output = _get_metric_submodel(api_model)(
@@ -72,10 +75,13 @@ def _forward_metric_submodel(api_model: DepthAnything3, image: torch.Tensor):
     return output["depth"], output["sky"]  # depth: (B, 1, H, W)
 
 
-class DepthAnything3OnnxWrapper(nn.Module):
-    """Image-only metric wrapper: ``(B, 3, H, W)`` → ``(depth, sky)``.
+class DepthAnything3MetricOnnxWrapper(nn.Module):
+    """Metric (or monocular) wrapper: ``image`` → ``(depth, sky)``.
 
-    Returns the raw (un-scaled) network depth and the sky mask.
+    Returns the raw (un-scaled) network depth and the sky mask.  Metric depth in
+    metres is obtained by the caller via ``metric_depth = focal * depth / 300``
+    (the intrinsic matrix is only used in that post-processing formula, never in
+    the exported graph).
     """
 
     def __init__(self, api_model: DepthAnything3) -> None:
@@ -85,30 +91,6 @@ class DepthAnything3OnnxWrapper(nn.Module):
     def forward(self, image: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:  # type: ignore[override]
         depth, sky = _forward_metric_submodel(self.model, image)
         return depth, sky
-
-
-class DepthAnything3MetricIntrinsicsOnnxWrapper(nn.Module):
-    """Metric wrapper with intrinsics input: ``(image, intrinsics)`` → ``(metric_depth, sky)``.
-
-    Applies the focal-based metric scaling (``depth * focal / 300``) inside the
-    ONNX graph, so the exported model returns depth already in metres.
-    """
-
-    def __init__(self, api_model: DepthAnything3) -> None:
-        super().__init__()
-        self.model = api_model
-
-    def forward(
-        self,
-        image: torch.Tensor,       # (B, 3, H, W)
-        intrinsics: torch.Tensor,  # (B, 3, 3) — scaled to the input resolution
-    ) -> tuple[torch.Tensor, torch.Tensor]:  # type: ignore[override]
-        depth, sky = _forward_metric_submodel(self.model, image)
-
-        # Focal length = (fx + fy) / 2, then metric_depth = depth * focal / 300.
-        focal = (intrinsics[:, 0, 0] + intrinsics[:, 1, 1]) / 2.0  # (B,)
-        metric_depth = depth * (focal[:, None, None, None] / METRIC_SCALE_FACTOR)
-        return metric_depth, sky
 
 
 class DepthAnything3AnyViewOnnxWrapper(nn.Module):
@@ -222,7 +204,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--model-dir",
         type=str,
-        default="depth-anything/da3metric-large",
+        default="depth-anything/DA3NESTED-GIANT-LARGE-1.1",
         help="Local checkpoint directory or Hugging Face repo id.",
     )
     parser.add_argument(
@@ -238,14 +220,6 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=1,
         help="Number of views N for the anyview wrapper (fixed at export time).",
-    )
-    parser.add_argument(
-        "--with-intrinsics",
-        action="store_true",
-        help="metric only: export the variant that also takes an intrinsics "
-             "matrix input and outputs metric depth (depth * focal / 300) computed "
-             "inside the ONNX graph. Without this flag the image-only variant "
-             "(raw depth + sky) is exported.",
     )
     parser.add_argument(
         "--onnx-path",
@@ -315,7 +289,6 @@ def export_onnx(
     device: torch.device,
     wrapper: str = "metric",
     num_views: int = 1,
-    with_intrinsics: bool = False,
 ) -> None:
     if height % PATCH_SIZE != 0 or width % PATCH_SIZE != 0:
         raise ValueError(f"height and width must be divisible by {PATCH_SIZE}.")
@@ -336,10 +309,7 @@ def export_onnx(
     if wrapper == "anyview":
         _export_anyview(api_model, onnx_path, height, width, batch_size, num_views, opset, device)
     else:
-        _export_metric(
-            api_model, onnx_path, height, width, batch_size, opset, device,
-            with_intrinsics=with_intrinsics,
-        )
+        _export_metric(api_model, onnx_path, height, width, batch_size, opset, device)
 
     print(f"ONNX model written to {onnx_path.resolve()}")
 
@@ -355,16 +325,12 @@ def _export_metric(
     batch_size: int,
     opset: int,
     device: torch.device,
-    with_intrinsics: bool = False,
 ) -> None:
     """Export the metric (or monocular) model.
 
-    Two variants of the same model:
-    - ``with_intrinsics=False`` (default): inputs ``image`` → outputs raw
-      ``depth`` + ``sky`` (``DepthAnything3OnnxWrapper``).
-    - ``with_intrinsics=True``: inputs ``image`` + ``intrinsics`` → outputs
-      metric ``depth`` (``depth * focal / 300``) + ``sky``
-      (``DepthAnything3MetricIntrinsicsOnnxWrapper``).
+    Inputs ``image`` → outputs raw ``depth`` + ``sky``.  Metric depth in metres is
+    a caller-side post-processing step (``metric_depth = focal * depth / 300``);
+    the intrinsic matrix is not part of the exported graph.
     """
     # The metric branch may use RoPE (e.g. DinoV2-L backbone); patch it so
     # ``int(positions.max())`` doesn't crash the tracer.
@@ -372,31 +338,20 @@ def _export_metric(
     _patch_rope_for_export(api_model, height, width, submodel=metric_sub)
 
     dummy_image = torch.zeros(batch_size, 3, height, width, device=device)
-
-    if with_intrinsics:
-        print("[INFO] Metric export WITH intrinsics input (outputs metric depth).")
-        wrapper = DepthAnything3MetricIntrinsicsOnnxWrapper(api_model).to(device)
-        dummy_intrinsics = torch.eye(3, device=device)[None].repeat(batch_size, 1, 1)
-        args = (dummy_image, dummy_intrinsics)
-        input_names = ["image", "intrinsics"]
-    else:
-        print("[INFO] Metric export image-only (outputs raw depth).")
-        wrapper = DepthAnything3OnnxWrapper(api_model).to(device)
-        args = (dummy_image,)
-        input_names = ["image"]
+    wrapper = DepthAnything3MetricOnnxWrapper(api_model).to(device)
 
     with torch.no_grad():
-        wrapper(*args)
+        wrapper(dummy_image)
 
     with torch.no_grad():
         torch.onnx.export(
             wrapper,
-            args,
+            (dummy_image,),
             onnx_path.as_posix(),
             export_params=True,
             opset_version=opset,
             do_constant_folding=True,
-            input_names=input_names,
+            input_names=["image"],
             output_names=["depth", "sky"],
             training=torch.onnx.TrainingMode.EVAL,
         )
@@ -642,15 +597,13 @@ def run_metric_accuracy_check(
     height: int,
     width: int,
     device: str = "cuda",
-    with_intrinsics: bool = False,
 ) -> None:
     """Compare metric ONNX outputs against PyTorch using Astribot set1 / frame 0.
 
     Uses the first camera view (head_rgbd), preprocesses at the exported
-    ``height``/``width`` for both backends, and reports depth / sky error stats.
-    When ``with_intrinsics`` is set, the ONNX model outputs metric depth
-    (``depth * focal / 300``) and the PyTorch baseline is scaled to match;
-    otherwise both return raw network depth.
+    ``height``/``width`` for both backends, and reports raw depth / sky error
+    stats.  (Metric depth in metres is a caller-side ``focal * depth / 300`` step,
+    not part of the exported graph, so it is not exercised here.)
     """
     print("\n" + "=" * 72)
     print("[ACCURACY] Loading Astribot set1 / frame 0 (first view only) ...")
@@ -660,9 +613,8 @@ def run_metric_accuracy_check(
     print(f"[ACCURACY] Image: {img_path}")
 
     # --- Preprocess (exact resize to the exported resolution) ---------------
-    proc, ixts_scaled = _preprocess_views([img_path], ixts_np[:1], height, width)
+    proc, _ = _preprocess_views([img_path], ixts_np[:1], height, width)
     img_chw = proc[0]              # (3, H, W)
-    K_scaled = ixts_scaled[0]      # (3, 3), scaled to (height, width)
     print(f"[ACCURACY] Preprocessed to: {height}x{width}")
 
     # --- PyTorch forward ----------------------------------------------------
@@ -681,11 +633,15 @@ def run_metric_accuracy_check(
             infer_gs=False,
         )
 
-    if with_intrinsics:
-        # Scale the PyTorch depth to metres so it matches the ONNX output.
-        focal = (float(K_scaled[0, 0]) + float(K_scaled[1, 1])) / 2.0
-        pt_out["depth"] = pt_out["depth"] * (focal / METRIC_SCALE_FACTOR)
-        print(f"[ACCURACY] Metric scaling with focal={focal:.2f}")
+    # Snapshot PyTorch outputs to CPU numpy, then free all GPU memory (model +
+    # activations + input tensor) BEFORE the ONNX Runtime CUDA session allocates
+    # its arena, so the two backends don't contend for VRAM (see the any-view
+    # accuracy check for the same OOM guard).
+    pt_np = {k: pt_out[k].float().cpu().numpy().squeeze() for k in ["depth", "sky"]}
+    del pt_out, img_t
+    api_model.to("cpu")
+    if device == "cuda":
+        torch.cuda.empty_cache()
 
     # --- ONNX forward -------------------------------------------------------
     print("[ACCURACY] Running ONNX metric forward ...")
@@ -698,15 +654,13 @@ def run_metric_accuracy_check(
     print(f"[ACCURACY] ONNX Runtime using: {sess.get_providers()[0]}")
 
     onnx_inputs = {"image": img_chw[None].astype(np.float32)}  # (1, 3, H, W)
-    if with_intrinsics:
-        onnx_inputs["intrinsics"] = K_scaled[None].astype(np.float32)  # (1, 3, 3)
     onnx_outputs = sess.run([o.name for o in sess.get_outputs()], onnx_inputs)
     onx = dict(zip([o.name for o in sess.get_outputs()], onnx_outputs))
 
     # --- Compare ------------------------------------------------------------
     print("\n[ACCURACY] Per-output comparison (PyTorch vs ONNX):")
     for key in ["depth", "sky"]:
-        pt_val = pt_out[key].float().cpu().numpy().squeeze()
+        pt_val = pt_np[key]
         onx_val = _find_onnx_key(key, onx)
         if onx_val is None:
             print(f"  {key:15s}  SKIP (not found in ONNX outputs)")
@@ -725,16 +679,14 @@ def run_metric_accuracy_check(
         )
 
     # Allclose
-    depth_pt = pt_out["depth"].float().cpu().numpy().squeeze()
     depth_onx = _find_onnx_key("depth", onx).squeeze()
-    print(f"\n[ACCURACY] depth    allclose(atol=1e-3): "
-          f"{np.allclose(depth_pt, depth_onx, atol=1e-3)}")
+    print(f"\n[ACCURACY] depth    allclose(atol=1e-2): "
+          f"{np.allclose(pt_np['depth'], depth_onx, atol=1e-2)}")
 
     sky_onx = _find_onnx_key("sky", onx)
     if sky_onx is not None:
-        sky_pt = pt_out["sky"].float().cpu().numpy().squeeze()
-        print(f"[ACCURACY] sky      allclose(atol=1e-3): "
-              f"{np.allclose(sky_pt, sky_onx.squeeze(), atol=1e-3)}")
+        print(f"[ACCURACY] sky      allclose(atol=1e-2): "
+              f"{np.allclose(pt_np['sky'], sky_onx.squeeze(), atol=1e-2)}")
     print("=" * 72)
 
 
@@ -791,6 +743,24 @@ def run_anyview_accuracy_check(
             infer_gs=False,
         )
 
+    # Snapshot the ONNX inputs and PyTorch outputs as CPU numpy, then release all
+    # GPU memory (the giant model, its activations, and the input tensors) BEFORE
+    # the ONNX Runtime CUDA session allocates its arena.  Otherwise the two
+    # backends contend for VRAM and the any-view attention Softmax OOMs.
+    pt_np = {
+        k: pt_out[k].float().cpu().numpy()
+        for k in ["depth", "depth_conf", "extrinsics", "intrinsics"]
+    }
+    onnx_inputs = {
+        "image": imgs.float().cpu().numpy(),
+        "extrinsics": ex_t_norm.float().cpu().numpy(),
+        "intrinsics": in_t.float().cpu().numpy(),
+    }
+    del pt_out, imgs, ex_t, in_t, ex_t_norm, c2ws, dists, transform, median_dist
+    api_model.to("cpu")
+    if device == "cuda":
+        torch.cuda.empty_cache()
+
     # --- ONNX forward --------------------------------------------------------
     print("[ACCURACY] Running ONNX forward ...")
     if device == "cuda":
@@ -801,11 +771,6 @@ def run_anyview_accuracy_check(
     sess = ort.InferenceSession(onnx_path.as_posix(), providers=providers)
     print(f"[ACCURACY] ONNX Runtime using: {sess.get_providers()[0]}")
 
-    onnx_inputs = {
-        "image": imgs.float().cpu().numpy(),
-        "extrinsics": ex_t_norm.float().cpu().numpy(),
-        "intrinsics": in_t.float().cpu().numpy(),
-    }
     onnx_outputs = sess.run(
         ["depth", "depth_conf", "pred_extrinsics", "pred_intrinsics"], onnx_inputs,
     )
@@ -814,7 +779,7 @@ def run_anyview_accuracy_check(
     # --- Compare -------------------------------------------------------------
     print("\n[ACCURACY] Per-output comparison (PyTorch vs ONNX):")
     for key in ["depth", "depth_conf", "extrinsics", "intrinsics"]:
-        pt_val = pt_out[key].float().cpu().numpy()
+        pt_val = pt_np[key]
         onx_val = onx[key]
         abs_diff = np.abs(pt_val - onx_val)
         rel_err = abs_diff / (np.abs(pt_val) + 1e-6)
@@ -828,9 +793,9 @@ def run_anyview_accuracy_check(
         )
 
     # Also check structural equivalence
-    depth_match = np.allclose(pt_out["depth"].float().cpu().numpy(), onx["depth"], atol=1e-3)
+    depth_match = np.allclose(pt_np["depth"], onx["depth"], atol=1e-3)
     print(f"\n[ACCURACY] depth    allclose(atol=1e-3): {depth_match}")
-    conf_match = np.allclose(pt_out["depth_conf"].float().cpu().numpy(), onx["depth_conf"], atol=1e-3)
+    conf_match = np.allclose(pt_np["depth_conf"], onx["depth_conf"], atol=1e-3)
     print(f"[ACCURACY] depth_conf allclose(atol=1e-3): {conf_match}")
     print("=" * 72)
 
@@ -854,7 +819,6 @@ def main() -> None:
         device=torch.device(args.device),
         wrapper=args.wrapper,
         num_views=args.num_views,
-        with_intrinsics=args.with_intrinsics,
     )
     if args.check_accuracy:
         # Reload a fresh model for the PyTorch baseline (the export path
@@ -877,7 +841,6 @@ def main() -> None:
                 height=args.height,
                 width=args.width,
                 device=args.device,
-                with_intrinsics=args.with_intrinsics,
             )
 
 

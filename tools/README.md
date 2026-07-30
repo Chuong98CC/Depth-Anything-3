@@ -25,21 +25,19 @@ Export a Depth Anything 3 checkpoint to ONNX. Supports two wrapper types and an
 optional PyTorch-vs-ONNX accuracy check on real multi-view data.
 
 - **`metric`** wrapper — single-image depth + sky (`DA3METRIC-LARGE`, or the
-  metric branch of a nested checkpoint). Comes in two variants, selected with
-  `--with-intrinsics`:
-  - **image-only** (default) — input `image`; outputs raw network `depth` + `sky`.
-  - **with intrinsics** (`--with-intrinsics`) — inputs `image` + `intrinsics`;
-    outputs metric `depth` (`depth * focal / 300`, in metres) + `sky`, with the
-    focal-based scaling computed inside the ONNX graph.
+  metric branch of a nested checkpoint). Input `image`; outputs raw network
+  `depth` + `sky`. Metric depth in metres is a **caller-side** post-processing
+  step (`metric_depth = focal * depth / 300`, `focal = (fx + fy) / 2`); the
+  intrinsic matrix is only used in that formula, never inside the ONNX graph, so
+  no intrinsics input is exported.
 - **`anyview`** wrapper — multi-view depth, confidence, and predicted camera
   parameters (the any-view branch of a nested checkpoint). Handles xFormers
   SwiGLU and RoPE tracing issues automatically.
 
 | Argument | Default | Description |
 |---|---|---|
-| `--model-dir` | `depth-anything/da3metric-large` | Local checkpoint dir or HuggingFace repo id |
+| `--model-dir` | `depth-anything/DA3NESTED-GIANT-LARGE-1.1` | Local checkpoint dir or HuggingFace repo id |
 | `--wrapper` | `metric` | `metric` or `anyview` |
-| `--with-intrinsics` | off | metric only: export the variant that also takes an `intrinsics` input and outputs metric depth (computed in-graph) |
 | `--num-views` | `3` | Number of views (cameras) `N` for the anyview wrapper (fixed at export). Default 3 for Head RGB, Head Stereo Left and Right. |
 | `--onnx-path` | `path/to/output_ckpt.onnx` | Output ONNX path |
 | `--height` | `490` | Input height (must be divisible by 14) |
@@ -50,23 +48,17 @@ optional PyTorch-vs-ONNX accuracy check on real multi-view data.
 | `--output-dir` | `.` | Output directory (used if `--onnx-path` unset) |
 | `--check-accuracy` | off | Compare ONNX vs PyTorch on Astribot set1 / frame 0 (preprocessed at the exported `--height`/`--width`) |
 
-**Metric model I/O by variant:**
+**Metric model I/O:**
 
-| Variant | Inputs | Outputs |
-|---|---|---|
-| image-only (default) | `image [B,3,H,W]` | `depth [B,1,H,W]` (raw), `sky [B,1,H,W]` |
-| `--with-intrinsics` | `image [B,3,H,W]`, `intrinsics [B,3,3]` | `depth [B,1,H,W]` (metres), `sky [B,1,H,W]` |
+| Inputs | Outputs |
+|---|---|
+| `image [B,3,H,W]` | `depth [B,1,H,W]` (raw), `sky [B,1,H,W]` |
 
 ```bash
-# Metric model — image-only variant (raw depth)
-python tools/export_onnx.py --model-dir depth-anything/DA3METRIC-LARGE \
+# Metric model (raw depth; apply focal * depth / 300 downstream for metres)
+python tools/export_onnx.py --model-dir depth-anything/DA3NESTED-GIANT-LARGE-1.1 \
     --wrapper metric --height 490 --width 644 \
     --onnx-path weights/da3_metric_644x490.onnx --check-accuracy
-
-# Metric model — with-intrinsics variant (metric depth in metres)
-python tools/export_onnx.py --model-dir depth-anything/DA3METRIC-LARGE \
-    --wrapper metric --height 490 --width 644 --with-intrinsics \
-    --onnx-path weights/da3_metric_644x490_intr.onnx --check-accuracy
 
 # Any-view branch of a nested checkpoint (3 views)
 python tools/export_onnx.py --model-dir depth-anything/DA3NESTED-GIANT-LARGE-1.1 \
@@ -108,7 +100,7 @@ multi-view frames to `model.inference`.
 |---|---|---|
 | `--camera-set` | `set1` | `set1` (3 views) or `set2` (4 views) |
 | `--frame` | `0` | Single frame index (0-based) |
-| `--model-name` | `depth-anything/DA3-SMALL` | Model name or HuggingFace Hub id |
+| `--model-name` | `depth-anything/DA3NESTED-GIANT-LARGE-1.1` | Model name or HuggingFace Hub id |
 | `--export-dir` | `output` | Directory to export results |
 | `--export-format` | `mini_npz-glb-depth_vis` | Hyphen-separated export formats |
 | `--process-res` | `644` | Base processing resolution |
@@ -177,7 +169,7 @@ frame 0. Reports per-output absolute / relative error and `allclose` checks.
 
 | Argument | Default | Description |
 |---|---|---|
-| `--model-dir` | *required* | PyTorch nested checkpoint (HuggingFace id or local dir) |
+| `--model-dir` | `depth-anything/DA3NESTED-GIANT-LARGE-1.1` | PyTorch nested checkpoint (HuggingFace id or local dir) |
 | `--onnx-anyview` | *required* | Any-view ONNX path |
 | `--onnx-metric` | *required* | Metric ONNX path |
 | `--device` | `cuda` | Device for PyTorch / ONNX Runtime |
@@ -186,7 +178,6 @@ frame 0. Reports per-output absolute / relative error and `allclose` checks.
 
 ```bash
 python tools/compare_nested_onnx_pt.py \
-    --model-dir depth-anything/DA3NESTED-GIANT-LARGE-1.1 \
     --onnx-anyview weights/da3_anyview_n3_644x490_giant-large-1.1.onnx \
     --onnx-metric  weights/da3_metric_644x490_giant-large-1.1.onnx
 ```
