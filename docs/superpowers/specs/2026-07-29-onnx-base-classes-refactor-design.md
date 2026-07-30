@@ -1,9 +1,49 @@
 # ONNX base-class refactor — design
 
-**Date:** 2026-07-29
+**Date:** 2026-07-29 (amended 2026-07-30 — see Amendment A)
 **Scope:** `tools/` — refactor duplicated ONNX inference code behind two new base
 classes, add three concrete ONNX model classes, and migrate the main nested
 ONNX inference script onto them.
+
+## Amendment A (2026-07-30) — letterbox preprocessing
+
+**Supersedes the exact-resize preprocessing described later in this doc.** Per
+user decision, the ONNX path must **strictly follow `TRTModel.resize_img`**
+([base_trt.py:78-114](../../../tools/model/base_trt.py)): aspect-preserving
+resize with a scale truncated to 2 decimals, then center-pad to the target size;
+crop the model output back on post-process (as `DA3MetricModel.parse_outputs`
+does). Rationale: exact-resize from 640×480 → 644×490 applies a non-uniform
+decimal scale (sx=1.00625, sy=1.02083) that distorts aspect ratio; letterbox
+uses one uniform scale + padding and avoids the distortion.
+
+Changes vs the original design:
+
+- **`BaseDA3Model` preprocessing** becomes letterbox:
+  - `scale = floor(min(tw/ow, th/oh) * 100) / 100` (guard ≤0 → raw); resize to
+    `(ow*scale, oh*scale)`; center-pad to `(th, tw)` with black; normalize after
+    padding.
+  - Per-view `meta = {orig_h, orig_w, scale_factor, tile_h, tile_w, pad_top,
+    pad_left}`.
+  - Intrinsics (uniform scale + pad offset): `fx*=scale`, `fy*=scale`,
+    `cx = cx*scale + pad_left`, `cy = cy*scale + pad_top`.
+- **New crop postprocess** `crop_to_tile(arr, meta)` → `arr[..., pad_top:pad_top+
+  tile_h, pad_left:pad_left+tile_w]`. Applied to depth/conf at the end of the
+  pipeline. Output intrinsics shifted back for the crop: `cx -= pad_left`,
+  `cy -= pad_top`.
+- **Nested pipeline:** each branch letterboxes the **source** image directly to
+  its own target (no intermediate resize) — this dissolves the earlier
+  double-resize concern. When any-view and metric share a target (the default
+  490×644 case), the metric branch reuses the any-view padded views; align at
+  padded size, then crop once.
+- **Verification anchor changes** from "byte-identical vs the old exact-resize
+  `infer_onnx_nested`" (now invalid) to **PyTorch-parity**: the ONNX pipeline
+  must reproduce the PyTorch nested model when both are fed the *same*
+  letterbox-preprocessed input.
+
+The base-class structure (Task 1 `ONNXModel`, the two-axis split, the concrete
+class set, migrating only `infer_onnx_nested.py`) is unchanged. Everything below
+stands except the preprocessing method and the verification, which this
+amendment overrides.
 
 ## Problem
 
