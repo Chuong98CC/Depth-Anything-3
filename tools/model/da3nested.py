@@ -1,223 +1,120 @@
-"""Nested Depth Anything v3 TensorRT wrapper.
+"""Nested Depth Anything v3 TensorRT pipeline (any-view + metric + alignment).
 
-Combines an any-view TRT engine with a metric TRT engine and aligns their
-outputs to reproduce the behaviour of ``NestedDepthAnything3Net``.
-
-Usage::
-
-    from tools.model.da3nested import DA3NestedModel
-    from tools.model.data_structure import CameraIntrinsics
-
-    nested = DA3NestedModel(
-        anyview_engine="weights/da3_anyview.trt",
-        metric_engine="weights/da3_metric.trt",
-        metric_intrinsics=CameraIntrinsics.from_intrinsics_matrix(K),
-    )
-    result = nested.infer(
-        imgs=["cam0.jpg", "cam1.jpg", "cam2.jpg"],
-        extrs=extrinsics_array,   # (N, 4, 4)
-        intrs=intrinsics_array,   # (N, 3, 3)
-    )
+Composes ``DA3AnyViewModel`` and ``DA3MetricModel`` and aligns their outputs to
+reproduce ``NestedDepthAnything3Net`` — the TRT sibling of ``DA3NestedONNX``.
+Output depth is left **unmasked** (only sky regions are set to max depth inside
+``align_anyview_with_metric``).
 """
 
 from __future__ import annotations
 
-import cv2
 import numpy as np
-import torch
 
-from .alignment import align_anyview_with_metric
-from .da3anyview import DA3AnyViewModel
-from .da3metric import DA3MetricModel
-from .data_structure import CameraIntrinsics
-
-# ---------------------------------------------------------------------------
-# ImageNet normalisation (must match both TRT engine expectations)
-# ---------------------------------------------------------------------------
-_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+from model.base_da3 import BaseDA3Model
+from model.da3anyview import DA3AnyViewModel
+from model.da3metric import DA3MetricModel
 
 
-class DA3NestedModel:
-    """Combined any-view + metric TRT pipeline replicating ``NestedDepthAnything3Net``.
-
-    Parameters
-    ----------
-    anyview_engine : str
-        Path to the any-view TRT engine (exported via ``--wrapper anyview``).
-    metric_engine : str
-        Path to the metric TRT engine (exported via ``--wrapper metric``).
-    metric_intrinsics : CameraIntrinsics
-        Intrinsics used by the metric model for focal-based scaling.
-        Only ``fx`` / ``fy`` are relevant; passed through the
-        ``CameraIntrinsics`` helper for consistency with ``DA3MetricModel``.
-    conf_thresh : float
-        Confidence threshold for masking low-confidence depth (default 0.5).
-    """
+class DA3NestedModel(BaseDA3Model):
+    """Any-view + metric TRT pipeline replicating the nested PyTorch model."""
 
     def __init__(
         self,
         anyview_engine: str,
         metric_engine: str,
-        metric_intrinsics: CameraIntrinsics,
         conf_thresh: float = 0.5,
     ) -> None:
-        # Any-view branch (multi-view, exact-resize preprocessing)
         self.av = DA3AnyViewModel(anyview_engine, conf_thresh=conf_thresh)
-
-        # Metric branch (single-image, but we bypass its built-in preprocessing)
-        self.metric = DA3MetricModel(
-            metric_engine, metric_intrinsics, conf_thresh=conf_thresh,
-        )
-
-        # Convenience
+        self.metric = DA3MetricModel(metric_engine)
         self.target_h = self.av.target_h
         self.target_w = self.av.target_w
-        self.num_views = self.av.num_views
-        self.conf_thresh = conf_thresh
-
-        # Metric-engine target size (may differ from any-view)
-        m_shape = self.metric.inputs[0]["shape"]  # (1, 3, H, W) or symbolic
-        self._metric_h = (
-            m_shape[2] if isinstance(m_shape[2], int) else self.target_h
-        )
-        self._metric_w = (
-            m_shape[3] if isinstance(m_shape[3], int) else self.target_w
-        )
         print(
-            f"Nested engine: anyview={self.target_h}x{self.target_w} (N={self.num_views}), "
-            f"metric={self._metric_h}x{self._metric_w}"
+            f"[NESTED-TRT] anyview N={self.av.num_views} @ "
+            f"{self.av.target_h}x{self.av.target_w}, "
+            f"metric @ {self.metric.target_h}x{self.metric.target_w}"
         )
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     def infer(
         self,
-        imgs: list[np.ndarray | str],
+        imgs: list,
         extrs: np.ndarray,
         intrs: np.ndarray,
+        *,
+        align_input_ext_scale: bool = True,
     ) -> dict:
-        """Run the full nested pipeline.
-
-        Parameters
-        ----------
-        imgs :
-            *N* BGR images (``uint8 (H,W,3)`` arrays) or absolute file paths.
-        extrs :
-            ``(N, 4, 4)`` camera extrinsics (world-to-camera convention).
-        intrs :
-            ``(N, 3, 3)`` camera intrinsics at the **original** image
-            resolution (re-scaled internally).
-
-        Returns
-        -------
-        dict with keys:
-            ``depth``       — aligned metric depth ``(N, H, W)``
-            ``depth_conf``  — confidence ``(N, H, W)``
-            ``extrinsics``  — predicted extrinsics ``(N, 3, 4)``
-            ``intrinsics``  — predicted intrinsics ``(N, 3, 3)``
-            ``scale_factor`` — least-squares scale factor (float)
-        """
-        # ---- 1. Any-view preprocessing + inference -------------------------
-        img_batch, intrs_adj, _metas = self.av.preprocess(imgs, intrs)   # (1,N,3,H,W)
-        extrs_norm = self.av._normalize_extrinsics(extrs)                 # (N,4,4)
-
-        av_raw = self.av._infer(img_batch, extrs_norm, intrs_adj)        # raw dict
-
-        # Normalise output keys
-        av = self._map_anyview_keys(av_raw)
-
-        # ---- 2. Metric inference (one view at a time) ---------------------
-        N = len(imgs)
-        metric_depths = np.zeros((N, self.target_h, self.target_w), dtype=np.float32)
-        metric_skys = np.zeros((N, self.target_h, self.target_w), dtype=np.float32)
-
-        for i, img in enumerate(imgs):
-            bgr = cv2.imread(img, cv2.IMREAD_COLOR) if isinstance(img, str) else img.copy()
-
-            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            rgb_m = cv2.resize(
-                rgb, (self._metric_w, self._metric_h), interpolation=cv2.INTER_LINEAR,
+        """Run the full nested pipeline; returns cropped numpy outputs."""
+        n = len(imgs)
+        if self.av.num_views is not None and n != self.av.num_views:
+            raise ValueError(
+                f"Got {n} views but the any-view engine expects "
+                f"{self.av.num_views}. Pass exactly {self.av.num_views} views."
             )
-            metric_inp = (rgb_m.astype(np.float32) / 255.0 - _MEAN) / _STD
 
-            m_raw = self.metric._infer(metric_inp)
-            m_depth, m_sky = self._extract_metric(m_raw)
-
-            if m_depth.shape[-2:] != (self.target_h, self.target_w):
-                m_depth = cv2.resize(
-                    m_depth, (self.target_w, self.target_h), interpolation=cv2.INTER_LINEAR,
-                )
-                m_sky = cv2.resize(
-                    m_sky, (self.target_w, self.target_h), interpolation=cv2.INTER_LINEAR,
-                )
-
-            metric_depths[i] = m_depth
-            metric_skys[i] = m_sky
-
-        # ---- 3. Alignment via shared `align_anyview_with_metric` ----------
-        # Convert numpy → torch, align, convert back
-        result = align_anyview_with_metric(
-            anyview_depth=torch.from_numpy(av["depth"]),
-            anyview_conf=torch.from_numpy(av["depth_conf"]),
-            anyview_extrinsics=torch.from_numpy(av["extrinsics"]),
-            anyview_intrinsics=torch.from_numpy(av["intrinsics"]),
-            metric_depth=torch.from_numpy(metric_depths[None]),   # add B=1
-            metric_sky=torch.from_numpy(metric_skys[None]),
+        # 1. Any-view: letterbox preprocess + normalize + run + map
+        img_batch, intrs_adj, metas = self.av.preprocess_views(imgs, intrs)
+        extrs_norm = self.normalize_extrinsics(extrs)
+        av = self.av.map_anyview_keys(
+            self.av._run(
+                {
+                    "image": img_batch.astype(np.float32),
+                    "extrinsics": extrs_norm[None].astype(np.float32),
+                    "intrinsics": intrs_adj[None].astype(np.float32),
+                }
+            )
         )
 
-        # Convert back to numpy, squeeze batch dim, apply confidence masking
-        out: dict = {}
-        for k in ("depth", "depth_conf", "extrinsics", "intrinsics"):
-            val = result[k]
-            if val.ndim >= 4 and val.shape[0] == 1:
-                val = val.squeeze(0)
-            out[k] = val.float().cpu().numpy()
+        # 2. Metric branch (letterbox grid; reuse the any-view padded views)
+        metric_depths, metric_skys = self._run_metric_branch(img_batch)
 
-        # Mask low-confidence depth
-        valid = out["depth_conf"] > self.conf_thresh
-        out["depth_raw"] = out["depth"].copy()
-        out["depth"] = out["depth"].copy()
-        out["depth"][~valid] = -1.0
+        # 3. Align any-view depth to metric (padded grid; sky handling inside)
+        result = self.align_with_metric(av, metric_depths, metric_skys)
 
-        return out
+        # 4. Optional Umeyama align to input poses (PyTorch inference default)
+        if align_input_ext_scale:
+            result = self.align_to_input(result, extrs, intrs_adj)
 
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
+        # 5. Crop padded outputs to the tile; un-pad intrinsics
+        return self._crop_result(result, metas)
 
-    @staticmethod
-    def _map_anyview_keys(raw: dict) -> dict:
-        """Normalise any-view engine output keys to canonical names."""
-        out: dict[str, np.ndarray] = {}
-        for name, val in raw.items():
-            low = name.lower()
-            if "depth_conf" in low or "conf" in low:
-                out["depth_conf"] = val
-            elif "pred_extrinsics" in low:
-                out["extrinsics"] = val
-            elif "pred_intrinsics" in low:
-                out["intrinsics"] = val
-            elif "depth" in low:
-                out["depth"] = val
-            else:
-                out[name] = val
-        return out
+    def _run_metric_branch(self, av_img_batch: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Per-view metric inference on the letterbox grid.
 
-    @staticmethod
-    def _extract_metric(raw: dict) -> tuple[np.ndarray, np.ndarray]:
-        """Extract (depth, sky) from raw metric engine outputs."""
-        depth = sky = None
-        for name, val in raw.items():
-            low = name.lower()
-            if "sky" in low:
-                sky = val.squeeze().astype(np.float32)
-            elif "depth" in low:
-                depth = val.squeeze().astype(np.float32)
-            elif depth is None:
-                depth = val.squeeze().astype(np.float32)
-        if sky is None:
-            sky = np.zeros_like(depth)
-        return depth, sky
+        Requires the metric engine to share the any-view target size (fail-fast
+        otherwise); reuses the already-letterboxed any-view padded views.
+        Returns ``(1, N, H, W)``.
+        """
+        h, w = self.av.target_h, self.av.target_w
+        mh, mw = self.metric.target_h, self.metric.target_w
+        if (mh, mw) != (h, w):
+            raise NotImplementedError(
+                "Nested pipeline requires the metric and any-view engines to "
+                f"share the input size; got metric {mh}x{mw} vs any-view {h}x{w}. "
+                "Re-export the metric engine at the any-view resolution."
+            )
+        n = av_img_batch.shape[1]
+        depths = np.zeros((1, n, h, w), dtype=np.float32)
+        skys = np.zeros((1, n, h, w), dtype=np.float32)
+        for i in range(n):
+            d, s = self.metric.infer_view(av_img_batch[0, i])
+            depths[0, i] = d
+            skys[0, i] = s
+        return depths, skys
+
+    def _crop_result(self, result: dict, metas: list) -> dict:
+        """Crop padded depth/conf to the tile region and un-pad the intrinsics."""
+        depth = np.stack(
+            [self.av.crop_to_tile(result["depth"][i], metas[i]) for i in range(len(metas))]
+        )
+        conf = np.stack(
+            [self.av.crop_to_tile(result["depth_conf"][i], metas[i]) for i in range(len(metas))]
+        )
+        intr = result["intrinsics"].copy()
+        for i, m in enumerate(metas):
+            intr[i, 0, 2] -= m["pad_left"]
+            intr[i, 1, 2] -= m["pad_top"]
+        return {
+            "depth": depth,
+            "depth_conf": conf,
+            "extrinsics": result["extrinsics"],
+            "intrinsics": intr,
+        }
