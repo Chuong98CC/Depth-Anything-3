@@ -21,7 +21,6 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 
-
 # ---------------------------------------------------------------------------
 # ImageNet normalisation — must match ONNX export / TRT wrapper
 # ---------------------------------------------------------------------------
@@ -32,6 +31,7 @@ _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 # ---------------------------------------------------------------------------
 # Helpers: identical preprocessing for ONNX and TRT paths
 # ---------------------------------------------------------------------------
+
 
 def preprocess_views(
     image_paths: list[str],
@@ -110,6 +110,7 @@ def _preprocess_one(
 # Data loading (mirrors astribot_dataloader)
 # ---------------------------------------------------------------------------
 
+
 def load_example_data() -> tuple[list[str], np.ndarray, np.ndarray]:
     """Load Astribot set1 / frame 0."""
     # Late import — the dataloader lives under tools/
@@ -126,6 +127,7 @@ def load_example_data() -> tuple[list[str], np.ndarray, np.ndarray]:
 # ---------------------------------------------------------------------------
 # ONNX inference
 # ---------------------------------------------------------------------------
+
 
 def run_onnx(
     onnx_path: str,
@@ -159,6 +161,7 @@ def run_onnx(
 # TRT inference
 # ---------------------------------------------------------------------------
 
+
 def run_trt(
     trt_path: str,
     img_batch: np.ndarray,
@@ -174,11 +177,14 @@ def run_trt(
     # TRT engine target H, W is read from the engine itself
     model = DA3AnyViewModel(trt_path)
 
-    # The TRT wrapper's _infer expects (N, ...) extrs/intrs (no batch dim)
-    raw = model._infer(
-        img_batch.astype(np.float32),
-        extrs.astype(np.float32),
-        intrs.astype(np.float32),
+    # DA3AnyViewModel now inherits the generic TRTModel._run; feed the
+    # already-preprocessed batch and add the batch dim to extrs/intrs.
+    raw = model._run(
+        {
+            "image": img_batch.astype(np.float32),
+            "extrinsics": extrs[None].astype(np.float32),
+            "intrinsics": intrs[None].astype(np.float32),
+        }
     )
     return raw
 
@@ -186,6 +192,7 @@ def run_trt(
 # ---------------------------------------------------------------------------
 # Comparison
 # ---------------------------------------------------------------------------
+
 
 def compare_outputs(
     onx: dict[str, np.ndarray],
@@ -202,10 +209,10 @@ def compare_outputs(
 
     # Normalise key names for consistent reporting
     key_pairs = [
-        ("depth",          "depth"),
-        ("depth_conf",     "conf"),
-        ("extrinsics",     "extrinsics"),
-        ("intrinsics",     "intrinsics"),
+        ("depth", "depth"),
+        ("depth_conf", "conf"),
+        ("extrinsics", "extrinsics"),
+        ("intrinsics", "intrinsics"),
     ]
 
     print("\n" + "=" * 72)
@@ -261,16 +268,21 @@ def compare_outputs(
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Compare any-view ONNX vs TRT on Astribot set1 / frame 0",
     )
-    parser.add_argument("--onnx-path", required=True, type=str,
-                        help="Path to any-view ONNX model.")
-    parser.add_argument("--trt-path", required=True, type=str,
-                        help="Path to any-view TRT engine.")
-    parser.add_argument("--device", default="cuda", choices=["cuda", "cpu"],
-                        help="ONNX Runtime device (TRT always uses CUDA).")
+    parser.add_argument(
+        "--onnx-path", required=True, type=str, help="Path to any-view ONNX model."
+    )
+    parser.add_argument("--trt-path", required=True, type=str, help="Path to any-view TRT engine.")
+    parser.add_argument(
+        "--device",
+        default="cuda",
+        choices=["cuda", "cpu"],
+        help="ONNX Runtime device (TRT always uses CUDA).",
+    )
     args = parser.parse_args()
 
     # 1. Load data ----------------------------------------------------------
