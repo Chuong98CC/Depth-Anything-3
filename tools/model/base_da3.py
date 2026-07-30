@@ -48,7 +48,11 @@ class BaseDA3Model:
         return proc[None], intrs_out, metas  # add B=1
 
     def _preprocess_one(
-        self, img, K: np.ndarray, target_h: int, target_w: int,
+        self,
+        img,
+        K: np.ndarray,
+        target_h: int,
+        target_w: int,
     ) -> tuple[np.ndarray, np.ndarray, dict]:
         """Preprocess a single view (path or BGR array)."""
         if isinstance(img, str):
@@ -134,7 +138,10 @@ class BaseDA3Model:
     # ---- alignment orchestration -------------------------------------------
 
     def align_with_metric(
-        self, av: dict, metric_depths: np.ndarray, metric_skys: np.ndarray,
+        self,
+        av: dict,
+        metric_depths: np.ndarray,
+        metric_skys: np.ndarray,
     ) -> dict[str, np.ndarray]:
         """Run ``align_anyview_with_metric`` and squeeze the batch dim.
 
@@ -159,7 +166,10 @@ class BaseDA3Model:
         return out
 
     def align_to_input(
-        self, result: dict, input_extrinsics: np.ndarray, input_intrinsics: np.ndarray,
+        self,
+        result: dict,
+        input_extrinsics: np.ndarray,
+        input_intrinsics: np.ndarray,
     ) -> dict:
         """Umeyama-align the prediction to the input camera poses (in place-ish).
 
