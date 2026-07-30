@@ -30,7 +30,7 @@ import numpy as np
 import torch
 
 from depth_anything_3.api import DepthAnything3
-from astribot_dataloader import load_images_camera_bundle
+from astribot_dataloader import load_images_cam_params
 
 
 
@@ -105,7 +105,7 @@ def main():
 
     frame_idx = args.frame
     print(f"\n--- Frame {frame_idx} ---")
-    images, exts, ixts, _, _, _, _ = load_images_camera_bundle(args.camera_set, frame_idx)
+    images, exts, ixts = load_images_cam_params(args.camera_set, frame_idx)
     print(f"  Views: {len(images)}")
     for img_path in images:
         print(f"    {img_path}")

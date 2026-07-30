@@ -16,7 +16,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import sys
+import cv2
 from pathlib import Path
 
 import numpy as np
@@ -25,27 +25,13 @@ import torch
 
 from depth_anything_3.api import DepthAnything3
 from model.alignment import align_anyview_with_metric
-
+from astribot_dataloader import load_images_cam_params
 
 # ---------------------------------------------------------------------------
 # Data loading (mirrors astribot_dataloader)
 # ---------------------------------------------------------------------------
 
-def _load_example_data() -> tuple[list[str], np.ndarray, np.ndarray]:
-    """Load Astribot set1 / frame 0 images, extrinsics, intrinsics."""
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from astribot_dataloader import CAMERA_SETS, load_calib, load_camera_data  # noqa: PLC0415
 
-    calib = load_calib(
-        "/home/chuong/workspace/demo_data/astribot_camera_calib_params/"
-        "astribot_calibration_full.json",
-        target_res=(640, 480),
-    )
-    camera_set = CAMERA_SETS["set1"]
-    images, exts, ixts, _, _ = load_camera_data(
-        calib, camera_set, frame_idx=0, sensor_type="color",
-    )
-    return images, exts, ixts
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +48,6 @@ def _preprocess_for_onnx(
     target_w: int,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Preprocess N images to (1, N, 3, H, W) with scaled intrinsics."""
-    import cv2  # noqa: PLC0415
 
     N = len(image_paths)
     proc = np.zeros((N, 3, target_h, target_w), dtype=np.float32)
@@ -316,7 +301,7 @@ def main() -> None:
 
     # 1. Load example data --------------------------------------------------
     print("[DATA] Loading Astribot set1 / frame 0 ...")
-    images, exts_np, ixts_np = _load_example_data()
+    images, exts_np, ixts_np = load_images_cam_params("set1", frame_idx=0)
     N = len(images)
     print(f"[DATA] {N} views loaded")
 

@@ -114,16 +114,9 @@ def load_example_data() -> tuple[list[str], np.ndarray, np.ndarray]:
     """Load Astribot set1 / frame 0."""
     # Late import — the dataloader lives under tools/
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-    from astribot_dataloader import CAMERA_SETS, load_calib, load_camera_data  # noqa: PLC0415
+    from astribot_dataloader import load_images_cam_params  # noqa: PLC0415
 
-    calib = load_calib(
-        "/home/chuong/workspace/demo_data/astribot_camera_calib_params/astribot_calibration_full.json",
-        target_res=(640, 480),
-    )
-    camera_set = CAMERA_SETS["set1"]
-    images, exts_np, ixts_np, _, _ = load_camera_data(
-        calib, camera_set, frame_idx=0, sensor_type="color",
-    )
+    images, exts_np, ixts_np = load_images_cam_params("set1", 0)
     print(f"[DATA] Loaded {len(images)} views:")
     for p in images:
         print(f"  {p}")

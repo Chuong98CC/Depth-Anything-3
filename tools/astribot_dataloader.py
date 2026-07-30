@@ -1,4 +1,5 @@
 import json
+import sys
 import numpy as np
 from typing import Optional
 from pathlib import Path
@@ -8,7 +9,7 @@ import cv2
 # Paths relative to repo root
 # ---------------------------------------------------------------------------
 DATA_ROOT = Path("/home/chuong/workspace/demo_data")
-CALIB_PATH = DATA_ROOT / "astribot_camera_calib_params" / "astribot_calibration_full.json"
+CALIB_PATH = DATA_ROOT / "astribot_camera_calib_params" / "astribot_calibration_full_640x480.json"
 IMAGES_ROOT = DATA_ROOT / "astribot_stereo_lrb" / "images"
 # ---------------------------------------------------------------------------
 # Mapping: image directory suffix → calibration key
@@ -26,6 +27,7 @@ DIR_TO_CALIB: dict[str, str] = {
 CALIB_TO_DIR: dict[str, str] = {v: k for k, v in DIR_TO_CALIB.items()}
 
 CAMERA_SETS: dict[str, list[str]] = {
+    "set0": [ "head_stereo_left", "head_stereo_right"],
     "set1": ["head_rgbd", "head_stereo_left", "head_stereo_right"],
     "set2": ["head_rgbd", "head_stereo_left", "head_stereo_right", "torso_rgbd"],
 }
@@ -101,7 +103,6 @@ def get_camera_params(
     calib: dict,
     camera_names: list[str],
     sensor_type: str = "color",
-    to_world_to_camera: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Extract extrinsics (N,4,4) and intrinsics (N,3,3) for given cameras.
 
@@ -117,10 +118,7 @@ def get_camera_params(
         cam = calib["camera"][name]
         exts.append(np.array(cam["extrinsics"]["matrix"], dtype=np.float64).reshape(4, 4))
         ixts.append(np.array(cam["intrinsics"][sensor_type]["matrix"], dtype=np.float64).reshape(3, 3))
-    exts = np.stack(exts)
-    if to_world_to_camera:
-        exts = convert_w2c_extrinsics(exts)
-    return exts, np.stack(ixts)
+    return np.stack(exts), np.stack(ixts)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -247,19 +245,12 @@ def approximate_depth_from_grayscale(gray_img: np.ndarray, max_depth_m: float = 
     depth_m = np.where(valid_mask, depth_m, 0.0)
     return depth_m, valid_mask
 
-def load_camera_data(
-    calib: dict,
-    camera_set: list[str],
-    frame_idx: int,
-    sensor_type: str = "color",
-) -> tuple[list[str], np.ndarray, np.ndarray]:
+def load_images_cam_params(camera_set: str, frame_idx: int) -> tuple[list[str], np.ndarray, np.ndarray]:
     """Load images, extrinsics, and intrinsics for one frame across cameras.
 
     Args:
-        calib: Scaled calibration dict.
-        camera_set: List of calibration keys.
+        camera_set: Name of the camera set (e.g. "set1").
         frame_idx: Frame index to load.
-        sensor_type: "color" or "depth".
 
     Returns:
         (image_paths, extrinsics, intrinsics) tuple:
@@ -267,25 +258,26 @@ def load_camera_data(
             extrinsics: ndarray shape (N, 4, 4).
             intrinsics: ndarray shape (N, 3, 3).
     """
-    images = [load_frame(key, frame_idx) for key in camera_set]
-    exts, ixts = get_camera_params(calib, camera_set, sensor_type=sensor_type)
+    camera_names = CAMERA_SETS[camera_set]
+    calib = load_calib(CALIB_PATH)
+    images = [load_frame(name, frame_idx) for name in camera_names]
+    exts, ixts = get_camera_params(calib, camera_names, sensor_type="color")
+    return images, exts, ixts
+
+def load_images_camera_depth_bundle(camera_set: str,
+                     frame_idx: int,) -> tuple[list[str], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    images, exts, ixts = load_images_cam_params(camera_set, frame_idx)
     depth_img_path = load_frame("head_depth", frame_idx)
     depth_img = cv2.imread(depth_img_path, cv2.IMREAD_UNCHANGED)
     depth_metrics, valid_mask = approximate_depth_from_grayscale(depth_img, max_depth_m=5.0)
-    # depth_colormap = normalize_depth_for_display(depth_metrics)
-    return images, exts, ixts, depth_metrics, valid_mask
-
-def load_images_camera_bundle(camera_set: str,
-                     frame_idx: int,) -> tuple[list[str], np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    camera_set_list = CAMERA_SETS[camera_set]
-    img_list, extrs, intrs, depth_metrics, valid_mask = load_camera_data(load_calib(CALIB_PATH), camera_set_list, frame_idx, sensor_type="color")
     depth_indices=[0] #Indices of images with depth data
-    camera_indices=list(range(len(img_list))) #Indices of images with camera data
-    return img_list, extrs, intrs, depth_metrics, valid_mask, depth_indices, camera_indices
+    camera_indices=list(range(len(images))) #Indices of images with camera data
+    return images, exts, ixts, depth_metrics, valid_mask, depth_indices, camera_indices
 
-# img_list, extrs, intrs, depth_metrics, valid_mask = load_images_cams("set1", 0)
-# p1, p2 = (174, 237), (321, 235)
-# real_dist = measure_pixel_distance(depth_metrics, intrs[0], p1, p2)
-# print(real_dist)
-# rgb_img = cv2.imread(img_list[0], cv2.IMREAD_COLOR)
-# draw_measurement(rgb_img, p1, p2, real_dist["dist_m"], save_path="measurement.jpg")
+def load_images_camera_stereo(frame_idx: int) -> tuple[list[str], np.ndarray, np.ndarray, float]:
+    images, exts, ixts = load_images_cam_params("set0", frame_idx)
+    # load baseline distance from calibration
+    calib = load_calib(CALIB_PATH)
+    baseline = calib["camera"]["head_stereo_left"]["baseline"] / 1000.0  # convert to metres
+    return images, exts, ixts, baseline
+
