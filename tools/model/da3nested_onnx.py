@@ -9,7 +9,6 @@ confidence-mask depth; only sky regions are set to max depth, handled inside
 
 from __future__ import annotations
 
-import cv2
 import numpy as np
 
 from model.base_da3 import BaseDA3Model
@@ -34,12 +33,12 @@ class DA3NestedONNX(BaseDA3Model):
 
     def infer(
         self,
-        imgs: list,
+        imgs: list[str | np.ndarray],
         extrs: np.ndarray,
         intrs: np.ndarray,
         *,
         align_input_ext_scale: bool = True,
-    ) -> dict:
+    ) -> dict[str, np.ndarray]:
         """Run the full nested pipeline; returns cropped numpy depth/conf/extrinsics/intrinsics."""
         n = len(imgs)
         if self.av.num_views is not None and n != self.av.num_views:
@@ -61,8 +60,8 @@ class DA3NestedONNX(BaseDA3Model):
             )
         )
 
-        # 2. Metric branch (letterbox source directly to the metric target)
-        metric_depths, metric_skys = self._run_metric_branch(imgs, intrs, img_batch)
+        # 2. Metric branch (reuses the any-view letterboxed grid; sizes must match)
+        metric_depths, metric_skys = self._run_metric_branch(img_batch)
 
         # 3. Align any-view depth to metric (padded grid; sky handling inside)
         result = self.align_with_metric(av, metric_depths, metric_skys)
@@ -76,40 +75,28 @@ class DA3NestedONNX(BaseDA3Model):
 
     def _run_metric_branch(
         self,
-        imgs: list,
-        intrs: np.ndarray,
         av_img_batch: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Per-view metric inference on the letterbox grid.
+        """Per-view metric inference on the any-view letterbox grid.
 
-        When the metric model shares the any-view target size (the default), the
-        already-letterboxed any-view padded views are reused verbatim — no extra
-        resize.  Otherwise the source images are letterboxed to the metric target
-        and the padded depth/sky are resized to the any-view padded grid so the
-        alignment sees a common grid.  Returns ``(1, N, H_av, W_av)``.
+        The metric model must share the any-view target size so the already
+        letterboxed any-view padded views can be reused verbatim — no extra
+        resize.  Returns ``(1, N, H_av, W_av)``.
         """
         h, w = self.av.target_h, self.av.target_w
         mh, mw = self.metric.target_h, self.metric.target_w
-        n = av_img_batch.shape[1]
-        same = (mh, mw) == (h, w)
-
-        if same:
-            m_batch = av_img_batch
-        else:
-            m_batch, _, _ = self.metric.preprocess_views(
-                imgs,
-                intrs,
-                target_h=mh,
-                target_w=mw,
+        if (mh, mw) != (h, w):
+            raise NotImplementedError(
+                "Nested pipeline requires the metric and any-view ONNX models to "
+                f"share the input size; got metric {mh}x{mw} vs any-view {h}x{w}. "
+                "Re-export the metric model at the any-view resolution."
             )
 
+        n = av_img_batch.shape[1]
         depths = np.zeros((1, n, h, w), dtype=np.float32)
         skys = np.zeros((1, n, h, w), dtype=np.float32)
         for i in range(n):
-            d, s = self.metric.infer_view(m_batch[0, i])
-            if not same:
-                d = cv2.resize(d, (w, h), interpolation=cv2.INTER_LINEAR)
-                s = cv2.resize(s, (w, h), interpolation=cv2.INTER_LINEAR)
+            d, s = self.metric.infer_view(av_img_batch[0, i])
             depths[0, i] = d
             skys[0, i] = s
         return depths, skys
