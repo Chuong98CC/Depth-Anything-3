@@ -21,7 +21,7 @@ class BaseDA3Model:
     _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
     _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
 
-    # ---- preprocessing (exact-resize style) --------------------------------
+    # ---- preprocessing (letterbox: aspect-preserve + pad) -------------------
 
     def preprocess_views(
         self,
@@ -54,7 +54,11 @@ class BaseDA3Model:
         target_h: int,
         target_w: int,
     ) -> tuple[np.ndarray, np.ndarray, dict]:
-        """Preprocess a single view (path or BGR array)."""
+        """Letterbox a single view (path or BGR array): aspect-preserving resize
+        with a 2-decimal-truncated scale, then center-pad to the target — mirrors
+        ``TRTModel.resize_img``.  Returns CHW float32, pad/scale-adjusted intrinsics,
+        and per-view meta for the crop-back on post-process.
+        """
         if isinstance(img, str):
             bgr = cv2.imread(img, cv2.IMREAD_COLOR)
             if bgr is None:
@@ -66,19 +70,61 @@ class BaseDA3Model:
 
         orig_h, orig_w = bgr.shape[:2]
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-        rgb_r = cv2.resize(rgb, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-        img_f = rgb_r.astype(np.float32) / 255.0
+
+        # Uniform scale, truncated to 2 decimals so the leftover fit is padded.
+        raw_scale = min(target_w / orig_w, target_h / orig_h)
+        scale = np.floor(raw_scale * 100.0) / 100.0
+        if scale <= 0:
+            scale = raw_scale
+
+        new_w = int(orig_w * scale)
+        new_h = int(orig_h * scale)
+        resized = cv2.resize(rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+        pad_w = target_w - new_w
+        pad_h = target_h - new_h
+        pad_top = pad_h // 2
+        pad_bottom = pad_h - pad_top
+        pad_left = pad_w // 2
+        pad_right = pad_w - pad_left
+        padded = cv2.copyMakeBorder(
+            resized,
+            pad_top,
+            pad_bottom,
+            pad_left,
+            pad_right,
+            cv2.BORDER_CONSTANT,
+            value=(0, 0, 0),
+        )
+
+        img_f = padded.astype(np.float32) / 255.0
         chw = ((img_f - self._MEAN) / self._STD).transpose(2, 0, 1).astype(np.float32)
 
-        sx, sy = target_w / orig_w, target_h / orig_h
+        # Uniform scale + pad offset on the principal point.
         K_adj = K.copy().astype(np.float32)
-        K_adj[0, 0] *= sx
-        K_adj[0, 2] *= sx
-        K_adj[1, 1] *= sy
-        K_adj[1, 2] *= sy
+        K_adj[0, 0] *= scale
+        K_adj[1, 1] *= scale
+        K_adj[0, 2] = K[0, 2] * scale + pad_left
+        K_adj[1, 2] = K[1, 2] * scale + pad_top
 
-        meta = {"orig_h": orig_h, "orig_w": orig_w, "scale_x": sx, "scale_y": sy}
+        meta = {
+            "orig_h": orig_h,
+            "orig_w": orig_w,
+            "scale_factor": float(scale),
+            "tile_h": new_h,
+            "tile_w": new_w,
+            "pad_top": int(pad_top),
+            "pad_left": int(pad_left),
+        }
         return chw, K_adj, meta
+
+    @staticmethod
+    def crop_to_tile(arr: np.ndarray, meta: dict) -> np.ndarray:
+        """Crop the last two dims to the unpadded tile region (mirrors
+        ``DA3MetricModel.parse_outputs``' crop)."""
+        pt, pl = meta["pad_top"], meta["pad_left"]
+        th, tw = meta["tile_h"], meta["tile_w"]
+        return arr[..., pt : pt + th, pl : pl + tw]
 
     # ---- extrinsics normalization ------------------------------------------
 
