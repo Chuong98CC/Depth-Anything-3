@@ -81,7 +81,10 @@ Basic usage
 ```bash
 python tools/export_trt.py weights/da3_anyview_n3_644x490.onnx --precision fp16
 ```
-To avoid environment set-up headache, please use the `tools/scripts/export_trt_docker.sh` instead,
+To avoid environment set-up headache, please use the docker command instead:
+```
+./tools/scripts/export_trt_docker.sh <absolute/path/to/checkpoint.onnx>
+```
 To inference the TRT model, install the matching TRT version in your python env by:
 ```bash
 pip install tensorrt-cu12==10.16.1.11

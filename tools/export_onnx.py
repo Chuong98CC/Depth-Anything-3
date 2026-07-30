@@ -65,13 +65,21 @@ def _forward_metric_submodel(api_model: DepthAnything3, image: torch.Tensor):
     the ONNX graph entirely.
     """
     model_in = image.unsqueeze(1)  # add single-view dimension → (B, 1, 3, H, W)
-    output = _get_metric_submodel(api_model)(
+    metric_model = _get_metric_submodel(api_model)
+
+    # IMPORTANT: avoid DepthAnything3Net.forward() here.
+    # The full forward applies mono sky post-processing with quantile/sort ops,
+    # which export to ONNX Sort/TopK and can exceed TensorRT TopK limits.
+    # For metric export we only need raw head outputs (depth + sky).
+    feats, _ = metric_model.backbone(
         model_in,
-        extrinsics=None,
-        intrinsics=None,
+        cam_token=None,
         export_feat_layers=[],
-        infer_gs=False,
+        ref_view_strategy="saddle_balanced",
     )
+    H, W = model_in.shape[-2], model_in.shape[-1]
+    with torch.autocast(device_type=model_in.device.type, enabled=False):
+        output = metric_model._process_depth_head(feats, H, W)
     return output["depth"], output["sky"]  # depth: (B, 1, H, W)
 
 

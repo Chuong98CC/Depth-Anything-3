@@ -2,26 +2,33 @@
 # Build a TensorRT engine from an ONNX checkpoint inside the NVIDIA TensorRT container.
 #
 # Usage:
-#   ./tools/scripts/export_trt_docker.sh <onnx_ckpt_name> <host_weights_dir> [precision]
+#   ./tools/scripts/export_trt_docker.sh <onnx_ckpt_path> [precision]
 #
 # Arguments:
-#   onnx_ckpt_name    Name of the ONNX file inside the weights dir, e.g. da3_metric_644x490_large.onnx
-#   host_weights_dir  Absolute path to the weights folder on the host,
-#                     e.g. /home/chuong/workspace/depth_models/Depth-Anything-3/weights
+#   onnx_ckpt_path    Absolute path to the ONNX file on the host,
+#                     e.g. /home/chuong/workspace/depth_models/Depth-Anything-3/weights/da3_metric_644x490_large.onnx
 #   precision         Optional TRT precision: fp16 (default), tf32, or fp32
 #
 # Example:
-#   ./tools/scripts/export_trt_docker.sh da3_metric_644x490_large.onnx \
-#       /home/chuong/workspace/depth_models/Depth-Anything-3/weights fp16
+#   ./tools/scripts/export_trt_docker.sh \
+#       /home/chuong/workspace/depth_models/Depth-Anything-3/weights/da3_metric_644x490_large.onnx fp16
 set -euo pipefail
 
-if [ "$#" -lt 2 ]; then
-    echo "Usage: $0 <onnx_ckpt_name> <host_weights_dir> [precision]" >&2
+if [ "$#" -lt 1 ]; then
+    echo "Usage: $0 <onnx_ckpt_path> [precision]" >&2
     exit 1
 fi
 
-ONNX_NAME="$1"
-HOST_WEIGHTS_DIR="$2"
+ONNX_CKPT_PATH="$1"
+PRECISION="${2:-fp16}"
+
+if [ ! -f "$ONNX_CKPT_PATH" ]; then
+    echo "ONNX file not found: $ONNX_CKPT_PATH" >&2
+    exit 1
+fi
+
+HOST_WEIGHTS_DIR="$(cd "$(dirname "$ONNX_CKPT_PATH")" && pwd)"
+ONNX_NAME="$(basename "$ONNX_CKPT_PATH")"
 
 
 # install tensorrt runtime in your env with: pip install tensorrt-cu12==10.16.1.11
@@ -39,4 +46,4 @@ docker run --gpus all -it --rm \
     -v "$HOST_WEIGHTS_DIR":$DOCKER_WORKDIR/weights \
     -v "$HOST_TOOLS_DIR":$DOCKER_WORKDIR \
     -w $DOCKER_WORKDIR $DOCKER_IMG \
-    bash -c "python export_trt.py $ONNX_PATH --trt_path $TRT_PATH --precision fp16"
+    bash -c "python export_trt.py $ONNX_PATH --trt_path $TRT_PATH --precision $PRECISION"
