@@ -164,43 +164,62 @@ python tools/infer_onnx_metric_depth.py \
 
 ## Validation / comparison
 
-### `compare_nested_onnx_pt.py`
+### `compare_onnx_pt.py`
 
-Compare the end-to-end PyTorch nested model against the split-ONNX pipeline
-(any-view ONNX + metric ONNX + `align_anyview_with_metric`) on a selectable
-Astribot camera set / frame. Runs on CUDA; the target H/W is read from the
-any-view ONNX model. Reports per-output absolute / relative error and `allclose`
-checks.
+Compare PyTorch vs ONNX outputs across the **metric**, **any-view**, and
+**nested** modules on a selectable Astribot camera set / frame. The ONNX side
+uses the shared wrapper classes (`DA3MetricONNX`, `DA3AnyViewONNX`,
+`DA3NestedONNX`); the PyTorch side runs the matching sub-model of a single nested
+checkpoint. Both sides consume identical letterbox-preprocessed inputs. Reports
+per-output `max`/`median` absolute / relative error and `allclose` checks. Runs
+on CUDA; the giant PyTorch model and the ONNX session never co-reside on the GPU
+(each module runs ONNX first, frees it, then the PyTorch forward), avoiding the
+any-view attention-Softmax OOM.
 
 | Argument | Default | Description |
 |---|---|---|
-| `--model-dir` | `depth-anything/DA3NESTED-GIANT-LARGE-1.1` | PyTorch nested checkpoint (HuggingFace id or local dir) |
-| `--onnx-anyview` | *required* | Any-view ONNX path (its input H/W sets the target size) |
-| `--onnx-metric` | *required* | Metric ONNX path |
-| `--camera-set` | `set0` | Astribot camera set (`set0`/`set1`/`set2`; view count must match the any-view export) |
+| `--model-dir` | `depth-anything/DA3NESTED-GIANT-LARGE-1.1` | PyTorch nested checkpoint (HuggingFace id or local dir); used for all modules |
+| `--onnx-anyview` | `weights/da3_anyview_n3_644x490_giant-large-1.1.onnx` | Any-view ONNX path |
+| `--onnx-metric` | `weights/da3_metric_644x490_giant-large-1.1.onnx` | Metric ONNX path |
+| `--modules` | `metric anyview nested` | Subset of modules to compare |
+| `--camera-set` | `set1` | Astribot camera set (`set0`/`set1`/`set2`; view count must match the any-view export) |
 | `--frame-idx` | `0` | Frame index to load (0-based) |
 
 ```bash
-python tools/compare_nested_onnx_pt.py \
+python tools/compare_onnx_pt.py \
     --onnx-anyview weights/da3_anyview_n3_644x490_giant-large-1.1.onnx \
     --onnx-metric  weights/da3_metric_644x490_giant-large-1.1.onnx \
-    --camera-set set0 --frame-idx 0
+    --camera-set set1 --frame-idx 0
 ```
 
 ### `compare_onnx_trt.py`
 
-Compare any-view ONNX vs TensorRT outputs on Astribot set1 / frame 0 using
-identical shared preprocessing. Reports per-output error statistics and
-`allclose` checks.
+Compare ONNX vs TensorRT outputs across the **metric**, **any-view**, and
+**nested** modules on a selectable Astribot camera set / frame. Every module
+reuses the shared wrapper classes (`DA3Metric*`, `DA3AnyView*`, `DA3Nested*`) so
+the two backends differ only in the inference engine. Reports per-output
+`max`/`median` absolute and relative error (median is the meaningful fp16 parity
+signal — `max` is inflated by fp16 tail noise) plus `allclose` checks. Modules
+run cheapest-first with GPU memory freed between them.
 
 | Argument | Default | Description |
 |---|---|---|
-| `--onnx-path` | *required* | Any-view ONNX path |
-| `--trt-path` | *required* | Any-view TensorRT engine path |
-| `--device` | `cuda` | ONNX Runtime device (TRT always uses CUDA) |
+| `--onnx-anyview` | *required* | Any-view ONNX path |
+| `--trt-anyview` | *required* | Any-view TensorRT engine path |
+| `--onnx-metric` | *required* | Metric ONNX path |
+| `--trt-metric` | *required* | Metric TensorRT engine path |
+| `--modules` | `metric anyview nested` | Subset of modules to compare |
+| `--camera-set` | `set1` | Astribot camera set (view count must match the any-view export) |
+| `--frame-idx` | `0` | Frame index to load (0-based) |
+
+Runs on CUDA. The metric module derives its focal as `(fx + fy) / 2` from the
+selected view's real camera intrinsics.
 
 ```bash
 python tools/compare_onnx_trt.py \
-    --onnx-path weights/da3_anyview_n3_644x490_small2.onnx \
-    --trt-path  weights/da3_anyview_n3_644x490_small2_fp16.engine
+    --onnx-anyview weights/da3_anyview_n3_644x490_giant-large-1.1.onnx \
+    --trt-anyview  weights/da3_anyview_n3_644x490_giant-large-1.1.engine \
+    --onnx-metric  weights/da3_metric_644x490_giant-large-1.1.onnx \
+    --trt-metric   weights/da3_metric_644x490_giant-large-1.1.engine \
+    --camera-set set1 --frame-idx 0
 ```
