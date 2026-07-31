@@ -121,7 +121,7 @@ class BaseDA3Model:
     @staticmethod
     def crop_to_tile(arr: np.ndarray, meta: dict) -> np.ndarray:
         """Crop the last two dims to the unpadded tile region (mirrors
-        ``DA3MetricModel.parse_outputs``' crop)."""
+        ``DA3MetricTRT.parse_outputs``' crop)."""
         pt, pl = meta["pad_top"], meta["pad_left"]
         th, tw = meta["tile_h"], meta["tile_w"]
         return arr[..., pt : pt + th, pl : pl + tw]
@@ -180,6 +180,34 @@ class BaseDA3Model:
         if sky is None:
             sky = np.zeros_like(depth)
         return depth, sky
+
+    @staticmethod
+    def apply_mono_sky(
+        depth: np.ndarray, sky: np.ndarray, threshold: float = 0.3
+    ) -> np.ndarray:
+        """Clamp sky-region depth to the non-sky 99th percentile (mono-sky post-proc).
+
+        NumPy replica of ``DepthAnything3Net._process_mono_sky_estimation`` — the
+        step the metric ONNX/TRT graph omits (its ``torch.quantile`` lowers to an
+        ONNX ``TopK`` that exceeds TensorRT limits, so it runs here, outside the
+        graph).  Applies only when both classes have >10 pixels; deterministic
+        (first 100k non-sky samples), matching the model's export-friendly forward.
+
+        Must run on the padded model-resolution output **before** any crop, so the
+        sample set and mask match the PyTorch forward.  Standalone metric inference
+        only — the nested pipeline feeds the raw metric depth to alignment.
+        """
+        non_sky = sky < threshold  # True = non-sky
+        if int(non_sky.sum()) <= 10 or int((~non_sky).sum()) <= 10:
+            return depth
+        sampled = depth[non_sky].reshape(-1)[:100_000]
+        # Append a single zero to guard the quantile against an empty tensor,
+        # exactly as the traced PyTorch path does.
+        safe = np.concatenate([sampled, np.zeros(1, dtype=sampled.dtype)])
+        non_sky_max = np.quantile(safe, 0.99)
+        out = depth.copy()
+        out[~non_sky] = non_sky_max
+        return out
 
     # ---- alignment orchestration -------------------------------------------
 

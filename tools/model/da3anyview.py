@@ -1,7 +1,7 @@
 """Depth Anything v3 any-view wrappers (TensorRT + ONNX).
 
 Multi-view depth + confidence + predicted camera parameters.  Both wrappers
-share ``BaseDA3Model`` (pre/post); ``DA3AnyViewModel`` runs a TensorRT engine
+share ``BaseDA3Model`` (pre/post); ``DA3AnyViewTRT`` runs a TensorRT engine
 (``TRTModel``) and ``DA3AnyViewONNX`` runs an ONNX session (``ONNXModel``).
 """
 
@@ -14,7 +14,7 @@ from model.base_onnx import ONNXModel
 from model.base_trt import TRTModel
 
 
-class DA3AnyViewModel(TRTModel, BaseDA3Model):
+class DA3AnyViewTRT(TRTModel, BaseDA3Model):
     """Any-view TRT inference: images (+ extrinsics/intrinsics) → depth bundle."""
 
     def __init__(self, engine_path: str, conf_thresh: float = 0.5) -> None:

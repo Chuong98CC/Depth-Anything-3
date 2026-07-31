@@ -29,7 +29,6 @@ import torch
 
 from astribot_dataloader import load_images_cam_params
 from depth_anything_3.api import DepthAnything3
-from export_onnx import _forward_metric_submodel
 from model.base_da3 import BaseDA3Model
 from model.da3anyview import DA3AnyViewONNX
 from model.da3metric import DA3MetricONNX
@@ -51,6 +50,11 @@ _BASE = BaseDA3Model()
 def _get_da3_submodel(api_model: DepthAnything3) -> torch.nn.Module:
     """Any-view sub-model: ``.model.da3`` (nested) or ``.model`` (plain)."""
     return getattr(api_model.model, "da3", api_model.model)
+
+
+def _get_metric_submodel(api_model: DepthAnything3) -> torch.nn.Module:
+    """Metric sub-model: ``.model.da3_metric`` (nested) or ``.model`` (plain)."""
+    return getattr(api_model.model, "da3_metric", api_model.model)
 
 
 # ---------------------------------------------------------------------------
@@ -122,21 +126,22 @@ def _check_view_count(model_views: int | None, n_images: int, what: str) -> None
 
 
 def _pt_metric(api_model: DepthAnything3, chw: np.ndarray) -> dict[str, np.ndarray]:
-    """Metric raw-head forward on one ``(3, H, W)`` view → ``{depth, sky}`` (H, W).
+    """Full metric forward on one ``(3, H, W)`` view → ``{depth, sky}`` (H, W).
 
-    Uses the exact ``_forward_metric_submodel`` path the ONNX graph is exported
-    from (backbone + depth head, no mono-sky depth post-processing), so the PyTorch
-    reference matches the exported graph.  Calling the full ``metric_model.forward``
-    would additionally apply sky-region depth post-processing that the ONNX graph
-    omits, inflating the error at sky / letterbox-padding pixels.
+    Runs the complete ``metric_model.forward`` — including the mono-sky depth
+    post-processing — so it validates the ONNX/TRT wrapper's ``infer_view`` with
+    ``apply_mono_sky=True`` (which replicates that step outside the graph).
     """
     dev = torch.device("cuda")
-    image = torch.from_numpy(chw)[None].to(dev).float()  # (1, 3, H, W)
+    img_t = torch.from_numpy(chw)[None, None].to(dev).float()  # (1, 1, 3, H, W)
+    metric_model = _get_metric_submodel(api_model)
     with torch.no_grad():
-        depth, sky = _forward_metric_submodel(api_model, image)
+        out = metric_model(
+            img_t, extrinsics=None, intrinsics=None, export_feat_layers=[], infer_gs=False
+        )
     return {
-        "depth": depth.float().cpu().numpy().squeeze(),
-        "sky": sky.float().cpu().numpy().squeeze(),
+        "depth": out["depth"].float().cpu().numpy().squeeze(),
+        "sky": out["sky"].float().cpu().numpy().squeeze(),
     }
 
 

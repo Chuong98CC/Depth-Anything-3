@@ -1,6 +1,6 @@
 """Nested Depth Anything v3 pipeline (any-view + metric + alignment).
 
-``DA3NestedModel`` composes the TensorRT any-view/metric wrappers and
+``DA3NestedTRT`` composes the TensorRT any-view/metric wrappers and
 ``DA3NestedONNX`` composes their ONNX siblings; both align their outputs to
 reproduce ``NestedDepthAnything3Net``.  Output depth is left **unmasked**
 (PyTorch does not confidence-mask depth; only sky regions are set to max depth
@@ -12,11 +12,11 @@ from __future__ import annotations
 import numpy as np
 
 from model.base_da3 import BaseDA3Model
-from model.da3anyview import DA3AnyViewModel, DA3AnyViewONNX
-from model.da3metric import DA3MetricModel, DA3MetricONNX
+from model.da3anyview import DA3AnyViewTRT, DA3AnyViewONNX
+from model.da3metric import DA3MetricTRT, DA3MetricONNX
 
 
-class DA3NestedModel(BaseDA3Model):
+class DA3NestedTRT(BaseDA3Model):
     """Any-view + metric TRT pipeline replicating the nested PyTorch model."""
 
     def __init__(
@@ -25,8 +25,8 @@ class DA3NestedModel(BaseDA3Model):
         metric_engine: str,
         conf_thresh: float = 0.5,
     ) -> None:
-        self.av = DA3AnyViewModel(anyview_engine, conf_thresh=conf_thresh)
-        self.metric = DA3MetricModel(metric_engine)
+        self.av = DA3AnyViewTRT(anyview_engine, conf_thresh=conf_thresh)
+        self.metric = DA3MetricTRT(metric_engine)
         self.target_h = self.av.target_h
         self.target_w = self.av.target_w
         print(
@@ -96,7 +96,7 @@ class DA3NestedModel(BaseDA3Model):
         depths = np.zeros((1, n, h, w), dtype=np.float32)
         skys = np.zeros((1, n, h, w), dtype=np.float32)
         for i in range(n):
-            d, s = self.metric.infer_view(av_img_batch[0, i])
+            d, s = self.metric.infer_view(av_img_batch[0, i], apply_mono_sky=False)
             depths[0, i] = d
             skys[0, i] = s
         return depths, skys
@@ -201,7 +201,7 @@ class DA3NestedONNX(BaseDA3Model):
         depths = np.zeros((1, n, h, w), dtype=np.float32)
         skys = np.zeros((1, n, h, w), dtype=np.float32)
         for i in range(n):
-            d, s = self.metric.infer_view(av_img_batch[0, i])
+            d, s = self.metric.infer_view(av_img_batch[0, i], apply_mono_sky=False)
             depths[0, i] = d
             skys[0, i] = s
         return depths, skys

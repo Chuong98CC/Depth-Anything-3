@@ -550,7 +550,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 Composes ``DA3AnyViewONNX`` and ``DA3MetricONNX`` and aligns their outputs to
 reproduce ``NestedDepthAnything3Net`` — the ONNX sibling of the TRT
-``DA3NestedModel``.  Output depth is left **unmasked** (PyTorch does not
+``DA3NestedTRT``.  Output depth is left **unmasked** (PyTorch does not
 confidence-mask depth; only sky regions are set to max depth, handled inside
 ``align_anyview_with_metric``).
 """

@@ -24,9 +24,9 @@ import gc
 import numpy as np
 
 from astribot_dataloader import load_images_cam_params
-from model.da3anyview import DA3AnyViewModel, DA3AnyViewONNX
-from model.da3metric import DA3MetricModel, DA3MetricONNX
-from model.da3nested import DA3NestedModel, DA3NestedONNX
+from model.da3anyview import DA3AnyViewTRT, DA3AnyViewONNX
+from model.da3metric import DA3MetricTRT, DA3MetricONNX
+from model.da3nested import DA3NestedTRT, DA3NestedONNX
 
 ALL_MODULES = ["metric", "anyview", "nested"]
 
@@ -108,7 +108,7 @@ def compare_metric(
     derives its focal as ``(fx + fy) / 2`` from these.
     """
     onnx = DA3MetricONNX(onnx_path, "cuda")
-    trt = DA3MetricModel(trt_path)
+    trt = DA3MetricTRT(trt_path)
 
     img_batch, _, _ = onnx.preprocess_views([image_path], intrinsics[None])
     chw = img_batch[0, 0]  # identical preprocessed input for both backends
@@ -135,7 +135,7 @@ def compare_anyview(
 ) -> None:
     """Any-view ONNX vs TRT (depth / conf / extrinsics / intrinsics)."""
     onnx = DA3AnyViewONNX(onnx_path, "cuda")
-    trt = DA3AnyViewModel(trt_path)
+    trt = DA3AnyViewTRT(trt_path)
 
     _check_view_count(onnx.num_views, len(images), "any-view")
 
@@ -158,7 +158,7 @@ def compare_nested(
 ) -> None:
     """Full nested pipeline ONNX vs TRT (any-view + metric + alignment)."""
     onnx = DA3NestedONNX(onnx_anyview, onnx_metric, "cuda")
-    trt = DA3NestedModel(trt_anyview, trt_metric)
+    trt = DA3NestedTRT(trt_anyview, trt_metric)
 
     _check_view_count(onnx.av.num_views, len(images), "nested any-view")
 
@@ -198,7 +198,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--onnx-metric",
                         default="weights/da3_metric_644x490_giant-large-1.1.onnx",
                         type=str, help="Metric ONNX path.")
-    parser.add_argument("--trt-metric", 
+    parser.add_argument("--trt-metric",
                         default="weights/da3_metric_644x490_giant-large-1.1.engine",
                         type=str, help="Metric TRT engine path.")
     parser.add_argument(

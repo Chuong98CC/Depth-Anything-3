@@ -11,7 +11,7 @@ ONNX inference script onto them.
 user decision, the ONNX path must **strictly follow `TRTModel.resize_img`**
 ([base_trt.py:78-114](../../../tools/model/base_trt.py)): aspect-preserving
 resize with a scale truncated to 2 decimals, then center-pad to the target size;
-crop the model output back on post-process (as `DA3MetricModel.parse_outputs`
+crop the model output back on post-process (as `DA3MetricTRT.parse_outputs`
 does). Rationale: exact-resize from 640×480 → 644×490 applies a non-uniform
 decimal scale (sx=1.00625, sy=1.02083) that distorts aspect ratio; letterbox
 uses one uniform scale + padding and avoids the distortion.
@@ -199,7 +199,7 @@ class DA3MetricONNX(ONNXModel, BaseDA3Model):
     def infer_view(self, img):            # single preprocessed CHW view → (depth, sky)
         return self.extract_metric(self.run({"image": img[None]}))
 
-# da3nested_onnx.py  — mirrors TRT DA3NestedModel (composition, not a session itself)
+# da3nested_onnx.py  — mirrors TRT DA3NestedTRT (composition, not a session itself)
 class DA3NestedONNX(BaseDA3Model):
     def __init__(self, anyview_path, metric_path, device="cuda"):
         self.av = DA3AnyViewONNX(anyview_path, device)

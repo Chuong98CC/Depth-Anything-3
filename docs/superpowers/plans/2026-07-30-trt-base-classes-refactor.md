@@ -4,7 +4,7 @@
 
 **Goal:** Rework the three TensorRT DA3 wrapper classes to inherit `TRTModel` + `BaseDA3Model` (mirroring the ONNX classes), and generalize `base_trt.py` so it stays shared across monocular / stereo / any-view engines.
 
-**Architecture:** `base_trt.TRTModel` gains 4-D+5-D geometry resolution and one name-matched `_run(named_inputs)` execution helper (replacing three copy-pasted `_infer` bodies). The three DA3 TRT classes (`DA3AnyViewModel`, `DA3MetricModel`, `DA3NestedModel`) are reworked in place to multiple-inherit `TRTModel` + `BaseDA3Model`, deleting their duplicated preprocessing / extrinsics-norm / key-mapping / masking / focal-scaling, exactly mirroring `DA3AnyViewONNX` / `DA3MetricONNX` / `DA3NestedONNX`.
+**Architecture:** `base_trt.TRTModel` gains 4-D+5-D geometry resolution and one name-matched `_run(named_inputs)` execution helper (replacing three copy-pasted `_infer` bodies). The three DA3 TRT classes (`DA3AnyViewTRT`, `DA3MetricTRT`, `DA3NestedTRT`) are reworked in place to multiple-inherit `TRTModel` + `BaseDA3Model`, deleting their duplicated preprocessing / extrinsics-norm / key-mapping / masking / focal-scaling, exactly mirroring `DA3AnyViewONNX` / `DA3MetricONNX` / `DA3NestedONNX`.
 
 **Tech Stack:** Python 3.10, numpy, opencv (cv2), torch, tensorrt 10.16. Run from repo root; `tools/` is on `sys.path[0]` so imports are `from model.X import Y` (no `tools.` prefix).
 
@@ -335,7 +335,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 ---
 
-### Task 2: rework `da3anyview.py` (`DA3AnyViewModel`) + fix `compare_onnx_trt.py`
+### Task 2: rework `da3anyview.py` (`DA3AnyViewTRT`) + fix `compare_onnx_trt.py`
 
 **Files:**
 - Modify: `tools/model/da3anyview.py` (full rewrite)
@@ -343,7 +343,7 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: `TRTModel` (Task 1: `_run`, `num_views`, `target_h/w`), `BaseDA3Model` (`preprocess_views`, `normalize_extrinsics`, `map_anyview_keys`).
-- Produces: `class DA3AnyViewModel(TRTModel, BaseDA3Model)` with `__init__(engine_path, conf_thresh=0.5)` and `infer(imgs, extrs, intrs, *, normalize_extrinsics=False) -> dict` (mapped raw `{depth, depth_conf, extrinsics, intrinsics}`, batched values).
+- Produces: `class DA3AnyViewTRT(TRTModel, BaseDA3Model)` with `__init__(engine_path, conf_thresh=0.5)` and `infer(imgs, extrs, intrs, *, normalize_extrinsics=False) -> dict` (mapped raw `{depth, depth_conf, extrinsics, intrinsics}`, batched values).
 
 - [ ] **Step 1: Rewrite `tools/model/da3anyview.py`**
 
@@ -365,7 +365,7 @@ from model.base_da3 import BaseDA3Model
 from model.base_trt import TRTModel
 
 
-class DA3AnyViewModel(TRTModel, BaseDA3Model):
+class DA3AnyViewTRT(TRTModel, BaseDA3Model):
     """Any-view TRT inference: images (+ extrinsics/intrinsics) → depth bundle."""
 
     def __init__(self, engine_path: str, conf_thresh: float = 0.5) -> None:
@@ -420,7 +420,7 @@ In `tools/compare_onnx_trt.py`, the `run_trt` function calls the removed `model.
 to:
 
 ```python
-    # DA3AnyViewModel now inherits the generic TRTModel._run; feed the
+    # DA3AnyViewTRT now inherits the generic TRTModel._run; feed the
     # already-preprocessed batch and add the batch dim to extrs/intrs.
     raw = model._run({
         "image": img_batch.astype(np.float32),
@@ -450,9 +450,9 @@ import sys; sys.path.insert(0, 'tools')
 scratch = sys.argv[1]
 import numpy as np
 from astribot_dataloader import load_images_cam_params
-from model.da3anyview import DA3AnyViewModel
+from model.da3anyview import DA3AnyViewTRT
 images, exts, ixts = load_images_cam_params('set1', 0)
-av = DA3AnyViewModel('weights/da3_anyview_n3_644x490_giant-large-1.1.engine')
+av = DA3AnyViewTRT('weights/da3_anyview_n3_644x490_giant-large-1.1.engine')
 out = av.infer(images, exts, ixts, normalize_extrinsics=True)
 np.savez(scratch + '/trt_av.npz', **{k: np.asarray(v) for k, v in out.items()})
 print('saved TRT any-view:', {k: out[k].shape for k in out})
@@ -494,7 +494,7 @@ Expected: per-key stats printed; gates pass; `ANYVIEW TRT-vs-ONNX PARITY OK`. If
 
 ```bash
 git add tools/model/da3anyview.py tools/compare_onnx_trt.py
-git commit -m "refactor(tools): DA3AnyViewModel inherits TRTModel + BaseDA3Model
+git commit -m "refactor(tools): DA3AnyViewTRT inherits TRTModel + BaseDA3Model
 
 Deletes the duplicated exact-resize preprocess, extrinsics-norm, parse_outputs
 masking, and multi-input _infer in favour of the shared bases; mirrors
@@ -506,14 +506,14 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 ---
 
-### Task 3: rework `da3metric.py` (`DA3MetricModel`)
+### Task 3: rework `da3metric.py` (`DA3MetricTRT`)
 
 **Files:**
 - Modify: `tools/model/da3metric.py` (full rewrite)
 
 **Interfaces:**
 - Consumes: `TRTModel` (`_run`), `BaseDA3Model` (`extract_metric`).
-- Produces: `class DA3MetricModel(TRTModel, BaseDA3Model)` with `infer_view(img: np.ndarray) -> tuple[np.ndarray, np.ndarray]` (img is a preprocessed `(3,H,W)` CHW array → `(depth, sky)`).
+- Produces: `class DA3MetricTRT(TRTModel, BaseDA3Model)` with `infer_view(img: np.ndarray) -> tuple[np.ndarray, np.ndarray]` (img is a preprocessed `(3,H,W)` CHW array → `(depth, sky)`).
 
 - [ ] **Step 1: Rewrite `tools/model/da3metric.py`**
 
@@ -534,7 +534,7 @@ from model.base_da3 import BaseDA3Model
 from model.base_trt import TRTModel
 
 
-class DA3MetricModel(TRTModel, BaseDA3Model):
+class DA3MetricTRT(TRTModel, BaseDA3Model):
     """Metric TRT inference on a single already-preprocessed view."""
 
     def infer_view(self, img: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -565,9 +565,9 @@ import sys; sys.path.insert(0, 'tools')
 scratch = sys.argv[1]
 import numpy as np
 from astribot_dataloader import load_images_cam_params
-from model.da3metric import DA3MetricModel
+from model.da3metric import DA3MetricTRT
 images, exts, ixts = load_images_cam_params('set1', 0)
-m = DA3MetricModel('weights/da3_metric_644x490_giant-large-1.1.engine')
+m = DA3MetricTRT('weights/da3_metric_644x490_giant-large-1.1.engine')
 view = m.preprocess_views(images[:1], ixts[:1], target_h=m.target_h, target_w=m.target_w)[0][0, 0]
 d, s = m.infer_view(view)
 np.savez(scratch + '/trt_metric.npz', view=view, depth=d, sky=s)
@@ -607,7 +607,7 @@ Expected: stats printed, gates pass, `METRIC TRT-vs-ONNX PARITY OK`. If a gate f
 
 ```bash
 git add tools/model/da3metric.py
-git commit -m "refactor(tools): DA3MetricModel inherits TRTModel + BaseDA3Model
+git commit -m "refactor(tools): DA3MetricTRT inherits TRTModel + BaseDA3Model
 
 Mirrors DA3MetricONNX: infer_view(chw) -> (depth, sky) raw. Drops the
 CameraIntrinsics focal-scaling/crop/mask standalone path (metric depth in
@@ -619,14 +619,14 @@ Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>"
 
 ---
 
-### Task 4: rework `da3nested.py` (`DA3NestedModel`)
+### Task 4: rework `da3nested.py` (`DA3NestedTRT`)
 
 **Files:**
 - Modify: `tools/model/da3nested.py` (full rewrite)
 
 **Interfaces:**
-- Consumes: `DA3AnyViewModel` (Task 2), `DA3MetricModel` (Task 3), `BaseDA3Model` (`normalize_extrinsics`, `map_anyview_keys`, `align_with_metric`, `align_to_input`, `crop_to_tile`), `TRTModel._run`.
-- Produces: `class DA3NestedModel(BaseDA3Model)` with `__init__(anyview_engine, metric_engine, conf_thresh=0.5)` and `infer(imgs, extrs, intrs, *, align_input_ext_scale=True) -> dict` (cropped tile-resolution `{depth (N,tile_h,tile_w), depth_conf, extrinsics (N,3,4), intrinsics (N,3,3)}`).
+- Consumes: `DA3AnyViewTRT` (Task 2), `DA3MetricTRT` (Task 3), `BaseDA3Model` (`normalize_extrinsics`, `map_anyview_keys`, `align_with_metric`, `align_to_input`, `crop_to_tile`), `TRTModel._run`.
+- Produces: `class DA3NestedTRT(BaseDA3Model)` with `__init__(anyview_engine, metric_engine, conf_thresh=0.5)` and `infer(imgs, extrs, intrs, *, align_input_ext_scale=True) -> dict` (cropped tile-resolution `{depth (N,tile_h,tile_w), depth_conf, extrinsics (N,3,4), intrinsics (N,3,3)}`).
 
 - [ ] **Step 1: Rewrite `tools/model/da3nested.py`**
 
@@ -635,7 +635,7 @@ Replace the entire file with:
 ```python
 """Nested Depth Anything v3 TensorRT pipeline (any-view + metric + alignment).
 
-Composes ``DA3AnyViewModel`` and ``DA3MetricModel`` and aligns their outputs to
+Composes ``DA3AnyViewTRT`` and ``DA3MetricTRT`` and aligns their outputs to
 reproduce ``NestedDepthAnything3Net`` — the TRT sibling of ``DA3NestedONNX``.
 Output depth is left **unmasked** (only sky regions are set to max depth inside
 ``align_anyview_with_metric``).
@@ -646,18 +646,18 @@ from __future__ import annotations
 import numpy as np
 
 from model.base_da3 import BaseDA3Model
-from model.da3anyview import DA3AnyViewModel
-from model.da3metric import DA3MetricModel
+from model.da3anyview import DA3AnyViewTRT
+from model.da3metric import DA3MetricTRT
 
 
-class DA3NestedModel(BaseDA3Model):
+class DA3NestedTRT(BaseDA3Model):
     """Any-view + metric TRT pipeline replicating the nested PyTorch model."""
 
     def __init__(
         self, anyview_engine: str, metric_engine: str, conf_thresh: float = 0.5,
     ) -> None:
-        self.av = DA3AnyViewModel(anyview_engine, conf_thresh=conf_thresh)
-        self.metric = DA3MetricModel(metric_engine)
+        self.av = DA3AnyViewTRT(anyview_engine, conf_thresh=conf_thresh)
+        self.metric = DA3MetricTRT(metric_engine)
         self.target_h = self.av.target_h
         self.target_w = self.av.target_w
         print(
@@ -764,9 +764,9 @@ flake8 --max-line-length 100 tools/model/da3nested.py
 python -c "
 import sys; sys.path.insert(0, 'tools')
 from astribot_dataloader import load_images_cam_params
-from model.da3nested import DA3NestedModel
+from model.da3nested import DA3NestedTRT
 images, exts, ixts = load_images_cam_params('set1', 0)
-n = DA3NestedModel('weights/da3_anyview_n3_644x490_giant-large-1.1.engine',
+n = DA3NestedTRT('weights/da3_anyview_n3_644x490_giant-large-1.1.engine',
                    'weights/da3_metric_644x490_giant-large-1.1.engine')
 r = n.infer(images, exts, ixts, align_input_ext_scale=True)
 for k in ('depth','depth_conf','extrinsics','intrinsics'):
@@ -794,9 +794,9 @@ import sys; sys.path.insert(0, 'tools')
 scratch = sys.argv[1]
 import numpy as np
 from astribot_dataloader import load_images_cam_params
-from model.da3nested import DA3NestedModel
+from model.da3nested import DA3NestedTRT
 images, exts, ixts = load_images_cam_params('set1', 0)
-n = DA3NestedModel('weights/da3_anyview_n3_644x490_giant-large-1.1.engine',
+n = DA3NestedTRT('weights/da3_anyview_n3_644x490_giant-large-1.1.engine',
                    'weights/da3_metric_644x490_giant-large-1.1.engine')
 r = n.infer(images, exts, ixts, align_input_ext_scale=True)
 np.savez(scratch + '/trt_nested.npz', **{k: np.asarray(v) for k, v in r.items()})
@@ -838,7 +838,7 @@ Expected: per-key stats; gates pass; `NESTED TRT-vs-ONNX PARITY OK`. If a gate f
 
 ```bash
 git add tools/model/da3nested.py
-git commit -m "refactor(tools): DA3NestedModel inherits BaseDA3Model, composes TRT models
+git commit -m "refactor(tools): DA3NestedTRT inherits BaseDA3Model, composes TRT models
 
 Mirrors DA3NestedONNX exactly (letterbox preprocess -> anyview+metric engines ->
 align -> crop). Drops the duplicated key-mapping/extract-metric/inline-align and
