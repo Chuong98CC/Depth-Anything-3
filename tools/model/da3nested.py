@@ -38,12 +38,17 @@ class DA3NestedTRT(BaseDA3Model):
     def infer(
         self,
         imgs: list,
-        extrs: np.ndarray,
+        extrs: np.ndarray | None,
         intrs: np.ndarray,
         *,
         align_input_ext_scale: bool = True,
     ) -> dict:
-        """Run the full nested pipeline; returns cropped numpy outputs."""
+        """Run the full nested pipeline; returns cropped numpy outputs.
+
+        When ``extrs is None`` (no camera pose) the model predicts its own poses
+        and the Umeyama input-pose alignment is skipped — the output keeps the
+        predicted poses, mirroring ``DepthAnything3.inference(extrinsics=None)``.
+        """
         n = len(imgs)
         if self.av.num_views is not None and n != self.av.num_views:
             raise ValueError(
@@ -51,16 +56,15 @@ class DA3NestedTRT(BaseDA3Model):
                 f"{self.av.num_views}. Pass exactly {self.av.num_views} views."
             )
 
-        # 1. Any-view: letterbox preprocess + normalize + run + map
+        # 1. Any-view: letterbox preprocess + (optional) pose prior + run + map.
+        # Extrinsics/intrinsics are fed only if the any-view engine was exported
+        # with camera pose; either way the raw poses drive step 4's alignment.
         img_batch, intrs_adj, metas = self.av.preprocess_views(imgs, intrs)
-        extrs_norm = self.normalize_extrinsics(extrs)
         av = self.av.map_anyview_keys(
             self.av._run(
-                {
-                    "image": img_batch.astype(np.float32),
-                    "extrinsics": extrs_norm[None].astype(np.float32),
-                    "intrinsics": intrs_adj[None].astype(np.float32),
-                }
+                self.av.build_anyview_feed(
+                    img_batch, extrs, intrs_adj, normalize_extrinsics=True
+                )
             )
         )
 
@@ -70,8 +74,10 @@ class DA3NestedTRT(BaseDA3Model):
         # 3. Align any-view depth to metric (padded grid; sky handling inside)
         result = self.align_with_metric(av, metric_depths, metric_skys)
 
-        # 4. Optional Umeyama align to input poses (PyTorch inference default)
-        if align_input_ext_scale:
+        # 4. Optional Umeyama align to input poses (PyTorch inference default).
+        # Skipped without input poses — matches DepthAnything3.inference, which
+        # returns predicted poses when extrinsics is None.
+        if align_input_ext_scale and extrs is not None:
             result = self.align_to_input(result, extrs, intrs_adj)
 
         # 5. Crop padded outputs to the tile; un-pad intrinsics
@@ -139,12 +145,17 @@ class DA3NestedONNX(BaseDA3Model):
     def infer(
         self,
         imgs: list[str | np.ndarray],
-        extrs: np.ndarray,
+        extrs: np.ndarray | None,
         intrs: np.ndarray,
         *,
         align_input_ext_scale: bool = True,
     ) -> dict[str, np.ndarray]:
-        """Run the full nested pipeline; returns cropped numpy depth/conf/extrinsics/intrinsics."""
+        """Run the full nested pipeline; returns cropped numpy depth/conf/extrinsics/intrinsics.
+
+        When ``extrs is None`` (no camera pose) the model predicts its own poses
+        and the Umeyama input-pose alignment is skipped — the output keeps the
+        predicted poses, mirroring ``DepthAnything3.inference(extrinsics=None)``.
+        """
         n = len(imgs)
         if self.av.num_views is not None and n != self.av.num_views:
             raise ValueError(
@@ -152,16 +163,15 @@ class DA3NestedONNX(BaseDA3Model):
                 f"{self.av.num_views}. Pass exactly {self.av.num_views} views."
             )
 
-        # 1. Any-view: letterbox preprocess + normalize + run + map
+        # 1. Any-view: letterbox preprocess + (optional) pose prior + run + map.
+        # Extrinsics/intrinsics are fed only if the any-view model was exported
+        # with camera pose; either way the raw poses drive step 4's alignment.
         img_batch, intrs_adj, metas = self.av.preprocess_views(imgs, intrs)
-        extrs_norm = self.normalize_extrinsics(extrs)
         av = self.av.map_anyview_keys(
             self.av.run(
-                {
-                    "image": img_batch.astype(np.float32),
-                    "extrinsics": extrs_norm[None].astype(np.float32),
-                    "intrinsics": intrs_adj[None].astype(np.float32),
-                }
+                self.av.build_anyview_feed(
+                    img_batch, extrs, intrs_adj, normalize_extrinsics=True
+                )
             )
         )
 
@@ -171,8 +181,10 @@ class DA3NestedONNX(BaseDA3Model):
         # 3. Align any-view depth to metric (padded grid; sky handling inside)
         result = self.align_with_metric(av, metric_depths, metric_skys)
 
-        # 4. Optional Umeyama align to input poses (PyTorch inference default)
-        if align_input_ext_scale:
+        # 4. Optional Umeyama align to input poses (PyTorch inference default).
+        # Skipped without input poses — matches DepthAnything3.inference, which
+        # returns predicted poses when extrinsics is None.
+        if align_input_ext_scale and extrs is not None:
             result = self.align_to_input(result, extrs, intrs_adj)
 
         # 5. Crop padded outputs back to the tile region; un-pad intrinsics

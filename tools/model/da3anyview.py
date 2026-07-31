@@ -25,7 +25,7 @@ class DA3AnyViewTRT(TRTModel, BaseDA3Model):
     def infer(
         self,
         imgs: list,
-        extrs: np.ndarray,
+        extrs: np.ndarray | None,
         intrs: np.ndarray,
         *,
         normalize_extrinsics: bool = False,
@@ -34,18 +34,16 @@ class DA3AnyViewTRT(TRTModel, BaseDA3Model):
 
         ``imgs`` are *N* paths or BGR arrays; ``extrs`` ``(N,4,4)``; ``intrs``
         ``(N,3,3)`` at original resolution.  Returns the mapped output dict with
-        batched values (``(1,N,…)``).  Extrinsics are normalized here only when
+        batched values (``(1,N,…)``).  ``extrs``/``intrs`` are fed only when the
+        engine was exported with camera pose (see ``uses_extrinsics``); otherwise
+        the model predicts its own poses.  Extrinsics are normalized here only when
         ``normalize_extrinsics=True`` (the graph does not normalize).
         """
         img_batch, intrs_adj, _ = self.preprocess_views(imgs, intrs)
-        ext = self.normalize_extrinsics(extrs) if normalize_extrinsics else extrs
-        raw = self._run(
-            {
-                "image": img_batch.astype(np.float32),
-                "extrinsics": ext[None].astype(np.float32),
-                "intrinsics": intrs_adj[None].astype(np.float32),
-            }
+        feed = self.build_anyview_feed(
+            img_batch, extrs, intrs_adj, normalize_extrinsics=normalize_extrinsics
         )
+        raw = self._run(feed)
         return self.map_anyview_keys(raw)
 
 
@@ -55,7 +53,7 @@ class DA3AnyViewONNX(ONNXModel, BaseDA3Model):
     def infer(
         self,
         imgs: list,
-        extrs: np.ndarray,
+        extrs: np.ndarray | None,
         intrs: np.ndarray,
         *,
         normalize_extrinsics: bool = False,
@@ -64,16 +62,14 @@ class DA3AnyViewONNX(ONNXModel, BaseDA3Model):
 
         ``imgs`` are *N* paths or BGR arrays; ``extrs`` ``(N,4,4)``; ``intrs``
         ``(N,3,3)`` at original resolution.  Returns the mapped output dict with
-        batched values (``(1,N,…)``).  Extrinsics are normalized here only when
+        batched values (``(1,N,…)``).  ``extrs``/``intrs`` are fed only when the
+        model was exported with camera pose (see ``uses_extrinsics``); otherwise the
+        model predicts its own poses.  Extrinsics are normalized here only when
         ``normalize_extrinsics=True`` (the ONNX graph does not normalize).
         """
         img_batch, intrs_adj, _ = self.preprocess_views(imgs, intrs)
-        ext = self.normalize_extrinsics(extrs) if normalize_extrinsics else extrs
-        raw = self.run(
-            {
-                "image": img_batch.astype(np.float32),
-                "extrinsics": ext[None].astype(np.float32),
-                "intrinsics": intrs_adj[None].astype(np.float32),
-            }
+        feed = self.build_anyview_feed(
+            img_batch, extrs, intrs_adj, normalize_extrinsics=normalize_extrinsics
         )
+        raw = self.run(feed)
         return self.map_anyview_keys(raw)

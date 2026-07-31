@@ -22,15 +22,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import json
 from pathlib import Path
-from typing import Optional
 
-import numpy as np
 import torch
 
 from depth_anything_3.api import DepthAnything3
-from astribot_dataloader import load_images_cam_params
+from tools.utils.astribot_dataloader import load_images_cam_params
 
 
 
@@ -77,6 +74,10 @@ def main():
         help="Torch device (default: auto-detect cuda/cpu)",
     )
     parser.add_argument(
+        "--use-extrinsics", action="store_true",
+        help="Use extrinsics for inference",
+    )
+    parser.add_argument(
         "--use-ray-pose", action="store_true",
         help="Use ray pose for inference",
     )
@@ -117,7 +118,7 @@ def main():
 
     prediction = model.inference(
         image=images,
-        extrinsics=exts if args.camera_set else None,
+        extrinsics=exts if args.use_extrinsics else None,
         intrinsics=ixts,
         align_to_input_ext_scale=True,
         infer_gs=args.infer_gs,
@@ -127,6 +128,11 @@ def main():
         export_format=args.export_format,
         use_ray_pose=args.use_ray_pose,
         show_cameras=args.show_cameras,
+        # Match the ONNX/TRT export (which pins "first"): the default
+        # "saddle_balanced" picks the reference view via a data-dependent argmin
+        # that is fp-noise-sensitive and does not survive ONNX export. Using
+        # "first" keeps this PyTorch reference consistent with the exported models.
+        ref_view_strategy="first",
     )
 
     print(f"  depth shape:    {prediction.depth.shape}")

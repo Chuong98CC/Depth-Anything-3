@@ -23,6 +23,24 @@ from depth_anything_3.api import DepthAnything3
 
 PATCH_SIZE = 14
 
+# Reference-view strategy pinned for the any-view export.
+#
+# The default ``saddle_balanced`` strategy selects a reference view via a
+# data-dependent ``argmin`` over a per-view "balance score". When one of that
+# score's sub-metrics is near-constant across views (e.g. the class-token
+# variance, whose spread can be ~1e-9 against values ~1e-3), ``normalize_metric``
+# subtracts nearly equal fp32 numbers — catastrophic cancellation — so the score,
+# and therefore the ``argmin``, is decided by rounding noise. PyTorch fp32 and
+# ONNX Runtime fp32 round that noise differently and pick *different* reference
+# views, which reorders the views only on one side and makes the whole multi-view
+# prediction diverge. (This block runs only when no camera pose is supplied; the
+# with-extrinsics graph skips it, which is why that export is faithful.)
+#
+# Pinning "first" removes the argmin entirely (view 0 is the reference, the
+# reorder becomes an identity), giving a deterministic graph that matches PyTorch.
+# Only affects the no-extrinsics export; harmless for the with-pose one.
+EXPORT_REF_VIEW_STRATEGY = "first"
+
 # ImageNet normalisation — shared by all preprocessing paths.
 _MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -104,29 +122,41 @@ class DepthAnything3MetricOnnxWrapper(nn.Module):
 class DepthAnything3AnyViewOnnxWrapper(nn.Module):
     """Wraps the any-view sub-model (da3) from a nested checkpoint for ONNX export.
 
-    Takes multi-view images with extrinsics and intrinsics; returns depth, confidence,
-    and predicted camera parameters.  The number of views *N* is fixed at export time.
+    Takes multi-view images and returns depth, confidence, and predicted camera
+    parameters.  The number of views *N* is fixed at export time.
+
+    When ``use_extrinsics`` is True the graph additionally consumes camera
+    ``extrinsics`` / ``intrinsics`` as priors (fed to the camera encoder).  When
+    False the graph takes only ``image`` and the model predicts poses itself —
+    matching the ``extrinsics=None`` inference path.  Note the da3 sub-model only
+    consumes ``intrinsics`` via the camera encoder (gated on ``extrinsics`` being
+    provided), so intrinsics are baked in together with extrinsics, never alone.
     """
 
-    def __init__(self, api_model: DepthAnything3) -> None:
+    def __init__(self, api_model: DepthAnything3, use_extrinsics: bool = True) -> None:
         super().__init__()
         self.model = api_model
+        self.use_extrinsics = use_extrinsics
 
     def forward(
         self,
         image: torch.Tensor,
-        extrinsics: torch.Tensor,
-        intrinsics: torch.Tensor,
+        extrinsics: torch.Tensor | None = None,
+        intrinsics: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         # image:      (B, N, 3, H, W)
-        # extrinsics: (B, N, 4, 4)
-        # intrinsics: (B, N, 3, 3)
+        # extrinsics: (B, N, 4, 4)  — only consumed when use_extrinsics is True
+        # intrinsics: (B, N, 3, 3)  — only consumed when use_extrinsics is True
+        if not self.use_extrinsics:
+            extrinsics = None
+            intrinsics = None
         output = _get_da3_submodel(self.model)(
             image,
             extrinsics=extrinsics,
             intrinsics=intrinsics,
             export_feat_layers=[],
             infer_gs=False,
+            ref_view_strategy=EXPORT_REF_VIEW_STRATEGY,
         )
         return (
             output["depth"],
@@ -134,77 +164,6 @@ class DepthAnything3AnyViewOnnxWrapper(nn.Module):
             output["extrinsics"],
             output["intrinsics"],
         )
-
-
-def align_anyview_with_metric(
-    anyview_depth: torch.Tensor,
-    anyview_conf: torch.Tensor,
-    anyview_extrinsics: torch.Tensor,
-    anyview_intrinsics: torch.Tensor,
-    metric_depth: torch.Tensor,
-    metric_sky: torch.Tensor,
-) -> dict[str, torch.Tensor]:
-    """Replicate ``NestedDepthAnything3Net`` alignment logic in standalone Python.
-
-    Mirrors the three post-processing steps so they run **outside** the ONNX graph:
-    1. Metric scaling via intrinsics
-    2. Least-squares depth alignment
-    3. Sky-region handling
-    """
-    from depth_anything_3.utils.alignment import (  # noqa: PLC0415
-        apply_metric_scaling,
-        compute_alignment_mask,
-        compute_sky_mask,
-        least_squares_scale_scalar,
-        sample_tensor_for_quantile,
-        set_sky_regions_to_max_depth,
-    )
-
-    # ---- step 1: metric scaling ------------------------------------------------
-    metric_depth = apply_metric_scaling(metric_depth, anyview_intrinsics)
-
-    # ---- step 2: least-squares scale alignment ---------------------------------
-    non_sky_mask = compute_sky_mask(metric_sky, threshold=0.3)
-    if non_sky_mask.sum() <= 10:
-        raise RuntimeError("Insufficient non-sky pixels for alignment")
-
-    depth_conf_ns = anyview_conf[non_sky_mask]
-    depth_conf_sampled = sample_tensor_for_quantile(depth_conf_ns, max_samples=100_000)
-    median_conf = torch.quantile(depth_conf_sampled, 0.5)
-
-    align_mask = compute_alignment_mask(
-        anyview_conf, non_sky_mask, anyview_depth, metric_depth, median_conf,
-    )
-
-    scale_factor = least_squares_scale_scalar(
-        metric_depth[align_mask], anyview_depth[align_mask],
-    )
-
-    anyview_depth = anyview_depth * scale_factor
-    anyview_extrinsics = anyview_extrinsics.clone()
-    anyview_extrinsics[:, :, :3, 3] *= scale_factor
-
-    # ---- step 3: sky-region handling -------------------------------------------
-    non_sky_depth = anyview_depth[non_sky_mask]
-    if non_sky_depth.numel() > 100_000:
-        idx = torch.randint(
-            0, non_sky_depth.numel(), (100_000,), device=non_sky_depth.device,
-        )
-        sampled_depth = non_sky_depth[idx]
-    else:
-        sampled_depth = non_sky_depth
-    non_sky_max = min(float(torch.quantile(sampled_depth, 0.99)), 200.0)
-
-    anyview_depth, anyview_conf = set_sky_regions_to_max_depth(
-        anyview_depth, anyview_conf, non_sky_mask, max_depth=non_sky_max,
-    )
-
-    return {
-        "depth": anyview_depth,
-        "depth_conf": anyview_conf,
-        "extrinsics": anyview_extrinsics,
-        "intrinsics": anyview_intrinsics,
-    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -272,6 +231,13 @@ def parse_args() -> argparse.Namespace:
         help="Directory to save ONNX outputs.",
     )
     parser.add_argument(
+        "--use-extrinsics", action="store_true",
+        help="Any-view wrapper only: bake camera extrinsics/intrinsics into the "
+             "ONNX graph as inputs (fed to the camera encoder as priors). When "
+             "omitted, the graph takes only `image` and the model predicts poses "
+             "itself.",
+    )
+    parser.add_argument(
         "--check-accuracy",
         action="store_true",
         help="After export, compare ONNX vs PyTorch outputs using Astribot "
@@ -297,6 +263,7 @@ def export_onnx(
     device: torch.device,
     wrapper: str = "metric",
     num_views: int = 1,
+    use_extrinsics: bool = True,
 ) -> None:
     if height % PATCH_SIZE != 0 or width % PATCH_SIZE != 0:
         raise ValueError(f"height and width must be divisible by {PATCH_SIZE}.")
@@ -315,7 +282,10 @@ def export_onnx(
     print(f"Model parameters: {param_count/1e6:.2f}M")
 
     if wrapper == "anyview":
-        _export_anyview(api_model, onnx_path, height, width, batch_size, num_views, opset, device)
+        _export_anyview(
+            api_model, onnx_path, height, width, batch_size, num_views, opset, device,
+            use_extrinsics=use_extrinsics,
+        )
     else:
         _export_metric(api_model, onnx_path, height, width, batch_size, opset, device)
 
@@ -486,27 +456,44 @@ def _export_anyview(
     num_views: int,
     opset: int,
     device: torch.device,
+    use_extrinsics: bool = True,
 ) -> None:
-    """Export the any-view sub-model via ``DepthAnything3AnyViewOnnxWrapper``."""
+    """Export the any-view sub-model via ``DepthAnything3AnyViewOnnxWrapper``.
+
+    When ``use_extrinsics`` is True the exported graph takes
+    ``(image, extrinsics, intrinsics)``; otherwise it takes only ``image`` and
+    the model predicts camera poses itself.
+    """
     _replace_swiglu_fused_with_pytorch(api_model)
     _patch_rope_for_export(api_model, height, width)
-    wrapper = DepthAnything3AnyViewOnnxWrapper(api_model).to(device)
+    wrapper = DepthAnything3AnyViewOnnxWrapper(api_model, use_extrinsics=use_extrinsics).to(device)
     dummy_image = torch.zeros(batch_size, num_views, 3, height, width, device=device)
-    dummy_extrinsics = torch.eye(4, device=device)[None, None].repeat(batch_size, num_views, 1, 1)
-    dummy_intrinsics = torch.eye(3, device=device)[None, None].repeat(batch_size, num_views, 1, 1)
+
+    if use_extrinsics:
+        dummy_extrinsics = torch.eye(4, device=device)[None, None].repeat(
+            batch_size, num_views, 1, 1
+        )
+        dummy_intrinsics = torch.eye(3, device=device)[None, None].repeat(
+            batch_size, num_views, 1, 1
+        )
+        export_args = (dummy_image, dummy_extrinsics, dummy_intrinsics)
+        input_names = ["image", "extrinsics", "intrinsics"]
+    else:
+        export_args = (dummy_image,)
+        input_names = ["image"]
 
     with torch.no_grad():
-        wrapper(dummy_image, dummy_extrinsics, dummy_intrinsics)
+        wrapper(*export_args)
 
     with torch.no_grad():
         torch.onnx.export(
             wrapper,
-            (dummy_image, dummy_extrinsics, dummy_intrinsics),
+            export_args,
             onnx_path.as_posix(),
             export_params=True,
             opset_version=opset,
             do_constant_folding=True,
-            input_names=["image", "extrinsics", "intrinsics"],
+            input_names=input_names,
             output_names=["depth", "depth_conf", "pred_extrinsics", "pred_intrinsics"],
             training=torch.onnx.TrainingMode.EVAL,
         )
@@ -555,7 +542,7 @@ def _validate_onnx(onnx_path: Path) -> None:
 
 def _load_astribot_frame0() -> tuple[list[str], np.ndarray, np.ndarray]:
     """Load Astribot set1 / frame 0 image paths, extrinsics, and intrinsics."""
-    from astribot_dataloader import load_images_cam_params  # noqa: PLC0415
+    from tools.utils.astribot_dataloader import load_images_cam_params  # noqa: PLC0415
 
     return load_images_cam_params("set1", 0)
 
@@ -705,12 +692,15 @@ def run_anyview_accuracy_check(
     width: int,
     num_views: int,
     device: str = "cuda",
+    use_extrinsics: bool = True,
 ) -> None:
     """Compare any-view ONNX outputs against PyTorch using real multi-view data.
 
     Loads ``set1`` / frame 0 from the Astribot dataset, preprocesses at the
     exported ``height``/``width`` for both backends, and reports per-output error
-    statistics.
+    statistics.  When ``use_extrinsics`` is False the extrinsics/intrinsics priors
+    are not fed to either backend (the model predicts poses), matching the graph
+    exported without ``--use-extrinsics``.
     """
     print("\n" + "=" * 72)
     print("[ACCURACY] Loading Astribot set1 / frame 0 ...")
@@ -745,10 +735,11 @@ def run_anyview_accuracy_check(
     with torch.no_grad():
         pt_out = _get_da3_submodel(api_model)(
             imgs,
-            extrinsics=ex_t_norm,
-            intrinsics=in_t,
+            extrinsics=ex_t_norm if use_extrinsics else None,
+            intrinsics=in_t if use_extrinsics else None,
             export_feat_layers=[],
             infer_gs=False,
+            ref_view_strategy=EXPORT_REF_VIEW_STRATEGY,
         )
 
     # Snapshot the ONNX inputs and PyTorch outputs as CPU numpy, then release all
@@ -759,11 +750,10 @@ def run_anyview_accuracy_check(
         k: pt_out[k].float().cpu().numpy()
         for k in ["depth", "depth_conf", "extrinsics", "intrinsics"]
     }
-    onnx_inputs = {
-        "image": imgs.float().cpu().numpy(),
-        "extrinsics": ex_t_norm.float().cpu().numpy(),
-        "intrinsics": in_t.float().cpu().numpy(),
-    }
+    onnx_inputs = {"image": imgs.float().cpu().numpy()}
+    if use_extrinsics:
+        onnx_inputs["extrinsics"] = ex_t_norm.float().cpu().numpy()
+        onnx_inputs["intrinsics"] = in_t.float().cpu().numpy()
     del pt_out, imgs, ex_t, in_t, ex_t_norm, c2ws, dists, transform, median_dist
     api_model.to("cpu")
     if device == "cuda":
@@ -827,6 +817,7 @@ def main() -> None:
         device=torch.device(args.device),
         wrapper=args.wrapper,
         num_views=args.num_views,
+        use_extrinsics=args.use_extrinsics,
     )
     if args.check_accuracy:
         # Reload a fresh model for the PyTorch baseline (the export path
@@ -841,6 +832,7 @@ def main() -> None:
                 width=args.width,
                 num_views=args.num_views,
                 device=args.device,
+                use_extrinsics=args.use_extrinsics,
             )
         else:
             run_metric_accuracy_check(

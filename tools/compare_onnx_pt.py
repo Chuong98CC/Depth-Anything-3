@@ -27,7 +27,8 @@ import gc
 import numpy as np
 import torch
 
-from astribot_dataloader import load_images_cam_params
+from tools.utils.astribot_dataloader import load_images_cam_params
+from tools.export_onnx import EXPORT_REF_VIEW_STRATEGY
 from depth_anything_3.api import DepthAnything3
 from model.base_da3 import BaseDA3Model
 from model.da3anyview import DA3AnyViewONNX
@@ -36,6 +37,13 @@ from model.da3nested import DA3NestedONNX
 
 ALL_MODULES = ["metric", "anyview", "nested"]
 DEFAULT_MODEL = "depth-anything/DA3NESTED-GIANT-LARGE-1.1"
+
+# Any-view ONNX defaults: plain (model predicts poses) vs the "-with-camera-pose"
+# export selected by --use-extrinsics (consumes extrinsics/intrinsics as priors).
+DEFAULT_ANYVIEW_ONNX = {
+    False: "weights/da3_anyview_n3_644x490_giant-large-1.1.onnx",
+    True: "weights/da3_anyview_n3_644x490_giant-large-1.1-with-camera-pose.onnx",
+}
 
 # Bare mixin instance for reusing the shared post-processing (align_to_input) on
 # the PyTorch side without an ONNX session.
@@ -62,8 +70,29 @@ def _get_metric_submodel(api_model: DepthAnything3) -> torch.nn.Module:
 # ---------------------------------------------------------------------------
 
 
-def _compare(pt: dict, onx: dict, label: str, keys: list[str]) -> None:
-    """Print per-output PyTorch-vs-ONNX error statistics for the given keys."""
+def _compare(
+    pt: dict,
+    onx: dict,
+    label: str,
+    keys: list[str],
+    atol: float = 1e-2,
+    rtol: float = 1e-3,
+    nonzero_eps: float = 1e-6,
+) -> None:
+    """Print per-output PyTorch-vs-ONNX error statistics for the given keys.
+
+    Relative error is reported over **non-zero reference elements only**: the
+    extrinsic/intrinsic matrices are structurally sparse (rotation off-diagonals,
+    the ``fx/fy/cx/cy`` intrinsic layout, an identity reference pose), and dividing
+    by a ~0 reference makes ``max_rel`` meaningless.  Also reports ``p99`` and the
+    fraction of elements within ``atol`` so a single boundary-pixel outlier (e.g. a
+    sky-mask flip in the nested depth) does not hide an otherwise-exact match.
+
+    The pass line uses ``np.allclose``'s combined tolerance ``|a-b| <= atol +
+    rtol*|b|`` so large-magnitude outputs (intrinsics in pixels, ~hundreds) are
+    judged relatively — a 0.1 px focal/principal difference is a ~1e-4 match, not
+    a failure at an absolute 1e-2.
+    """
     print(f"\n{'=' * 72}")
     print(f"[COMPARE] {label}")
     print(f"{'-' * 72}")
@@ -84,23 +113,44 @@ def _compare(pt: dict, onx: dict, label: str, keys: list[str]) -> None:
         a = p.astype(np.float64)
         b = o.astype(np.float64)
         valid = np.isfinite(a) & np.isfinite(b)
-        abs_diff = np.abs(a - b)[valid]
-        rel_err = abs_diff / (np.abs(a[valid]) + 1e-8)
+        av = a[valid]
+        abs_diff = np.abs(av - b[valid])
 
+        # Relative error only where the reference is non-zero (sparse-matrix safe).
+        nz = np.abs(av) > nonzero_eps
+        if nz.any():
+            rel_err = abs_diff[nz] / np.abs(av[nz])
+            max_rel, med_rel = float(rel_err.max()), float(np.median(rel_err))
+        else:
+            max_rel = med_rel = 0.0
+
+        frac_ok = float((abs_diff <= atol).mean())
         print(
             f"  {key:12s} "
             f"max_abs={float(abs_diff.max()):.3e}  "
             f"med_abs={float(np.median(abs_diff)):.3e}  "
-            f"max_rel={float(rel_err.max()):.3e}  "
-            f"med_rel={float(np.median(rel_err)):.3e}  "
-            f"shape={list(p.shape)}"
+            f"p99_abs={float(np.percentile(abs_diff, 99)):.3e}  "
+            f"max_rel={max_rel:.3e}  "
+            f"med_rel={med_rel:.3e}  "
+            f"within_atol={100 * frac_ok:.4f}%  "
+            f"nz={int(nz.sum())}/{av.size}"
         )
 
     print(f"{'-' * 72}")
     for key in keys:
         if key in pt and key in onx and np.asarray(pt[key]).shape == np.asarray(onx[key]).shape:
-            ok = np.allclose(pt[key], onx[key], atol=1e-2)
-            print(f"[COMPARE] {key:12s} allclose(atol=1e-2): {ok}")
+            a = np.asarray(pt[key]).astype(np.float64)
+            b = np.asarray(onx[key]).astype(np.float64)
+            diff = np.abs(a - b)
+            tol = atol + rtol * np.abs(b)
+            bad = diff > tol
+            ok = not bool(bad.any())
+            tail = (
+                ""
+                if ok
+                else f"  ({int(bad.sum())}/{diff.size} over tol; p99.9={np.percentile(diff, 99.9):.2e})"
+            )
+            print(f"[COMPARE] {key:12s} allclose(atol={atol:g}, rtol={rtol:g}): {ok}{tail}")
     print(f"{'=' * 72}")
 
 
@@ -150,15 +200,23 @@ def _pt_anyview(
     img_batch: np.ndarray,
     intrs_adj: np.ndarray,
     exts_norm: np.ndarray,
+    use_extrinsics: bool = True,
 ) -> dict[str, np.ndarray]:
-    """Any-view sub-model → ``{depth, depth_conf, extrinsics, intrinsics}`` (1, N, …)."""
+    """Any-view sub-model → ``{depth, depth_conf, extrinsics, intrinsics}`` (1, N, …).
+
+    ``extrinsics``/``intrinsics`` are passed as priors only when ``use_extrinsics``,
+    matching whether the ONNX graph consumes them (a "-with-camera-pose" export).
+    """
     dev = torch.device("cuda")
     imgs_t = torch.from_numpy(img_batch).to(dev).float()  # (1, N, 3, H, W)
-    ex_t = torch.from_numpy(exts_norm[None]).to(dev).float()  # (1, N, 4, 4)
-    in_t = torch.from_numpy(intrs_adj[None]).to(dev).float()  # (1, N, 3, 3)
+    ex_t = in_t = None
+    if use_extrinsics:
+        ex_t = torch.from_numpy(exts_norm[None]).to(dev).float()  # (1, N, 4, 4)
+        in_t = torch.from_numpy(intrs_adj[None]).to(dev).float()  # (1, N, 3, 3)
     with torch.no_grad():
         out = _get_da3_submodel(api_model)(
-            imgs_t, extrinsics=ex_t, intrinsics=in_t, export_feat_layers=[], infer_gs=False
+            imgs_t, extrinsics=ex_t, intrinsics=in_t, export_feat_layers=[], infer_gs=False,
+            ref_view_strategy=EXPORT_REF_VIEW_STRATEGY,
         )
     return {
         k: out[k].float().cpu().numpy()
@@ -172,6 +230,7 @@ def _pt_nested(
     intrs_adj: np.ndarray,
     exts: np.ndarray,
     metas: list[dict],
+    use_extrinsics: bool = True,
 ) -> dict[str, np.ndarray]:
     """Full nested model (any-view + metric + alignment), cropped to the tile.
 
@@ -183,13 +242,16 @@ def _pt_nested(
     same per-view metas the wrapper uses.
     """
     dev = torch.device("cuda")
-    exts_norm = BaseDA3Model.normalize_extrinsics(exts)
     imgs_t = torch.from_numpy(img_batch).to(dev).float()
-    ex_t = torch.from_numpy(exts_norm[None]).to(dev).float()
-    in_t = torch.from_numpy(intrs_adj[None]).to(dev).float()
+    ex_t = in_t = None
+    if use_extrinsics:
+        exts_norm = BaseDA3Model.normalize_extrinsics(exts)
+        ex_t = torch.from_numpy(exts_norm[None]).to(dev).float()
+        in_t = torch.from_numpy(intrs_adj[None]).to(dev).float()
     with torch.no_grad():
         out = api_model.model(
-            imgs_t, extrinsics=ex_t, intrinsics=in_t, export_feat_layers=[], infer_gs=False
+            imgs_t, extrinsics=ex_t, intrinsics=in_t, export_feat_layers=[], infer_gs=False,
+            ref_view_strategy=EXPORT_REF_VIEW_STRATEGY,
         )
     result = {
         k: out[k].float().cpu().numpy()
@@ -200,7 +262,10 @@ def _pt_nested(
 
     # Umeyama align to the input poses — matches DA3NestedONNX's default
     # align_input_ext_scale=True (raw extrinsics + letterbox-scaled intrinsics).
-    result = _BASE.align_to_input(result, exts, intrs_adj)
+    # Skipped without camera pose so the predicted poses are compared directly,
+    # exactly as DA3NestedONNX does when extrs is None.
+    if use_extrinsics:
+        result = _BASE.align_to_input(result, exts, intrs_adj)
 
     # Crop padded depth/conf to the tile and un-pad the intrinsics (mirrors
     # DA3NestedONNX._crop_result).
@@ -259,6 +324,10 @@ def compare_anyview(
     """Any-view PyTorch vs ONNX (depth / conf / extrinsics / intrinsics)."""
     onnx = DA3AnyViewONNX(onnx_path, "cuda")
     _check_view_count(onnx.num_views, len(images), "any-view")
+    # The loaded graph is the single source of truth for whether poses are used;
+    # drive the PyTorch reference the same way so the two sides stay comparable.
+    use_ext = onnx.uses_extrinsics
+    print(f"[COMPARE] any-view uses camera pose: {use_ext}")
     img_batch, intrs_adj, _ = onnx.preprocess_views(images, ixts)
     onx = onnx.infer(images, exts, ixts, normalize_extrinsics=True)
     del onnx
@@ -266,7 +335,7 @@ def compare_anyview(
 
     exts_norm = BaseDA3Model.normalize_extrinsics(exts)
     api_model.to("cuda")
-    pt = _pt_anyview(api_model, img_batch, intrs_adj, exts_norm)
+    pt = _pt_anyview(api_model, img_batch, intrs_adj, exts_norm, use_extrinsics=use_ext)
     api_model.to("cpu")
     _cuda_gc()
 
@@ -286,13 +355,19 @@ def compare_nested(
     """Full nested pipeline PyTorch vs ONNX (any-view + metric + alignment)."""
     onnx = DA3NestedONNX(onnx_anyview, onnx_metric, "cuda")
     _check_view_count(onnx.av.num_views, len(images), "nested any-view")
+    # Match the PyTorch any-view branch to the loaded graph's pose usage.
+    use_ext = onnx.av.uses_extrinsics
+    print(f"[COMPARE] nested any-view uses camera pose: {use_ext}")
+    # Feed/align to input poses only in the with-camera-pose case; otherwise both
+    # sides keep predicted poses (so the comparison actually exercises them).
+    exts_in = exts if use_ext else None
     img_batch, intrs_adj, metas = onnx.av.preprocess_views(images, ixts)
-    onx = onnx.infer(images, exts, ixts, align_input_ext_scale=True)
+    onx = onnx.infer(images, exts_in, ixts, align_input_ext_scale=True)
     del onnx
     _cuda_gc()
 
     api_model.to("cuda")
-    pt = _pt_nested(api_model, img_batch, intrs_adj, exts, metas)
+    pt = _pt_nested(api_model, img_batch, intrs_adj, exts_in, metas, use_extrinsics=use_ext)
     api_model.to("cpu")
     _cuda_gc()
 
@@ -317,10 +392,18 @@ def parse_args() -> argparse.Namespace:
         help="PyTorch nested checkpoint (HuggingFace id or local dir); used for all modules.",
     )
     parser.add_argument(
+        "--use-extrinsics",
+        action="store_true",
+        help="Compare the '-with-camera-pose' any-view model (consumes camera "
+        "extrinsics/intrinsics as priors). Selects that ONNX checkpoint by default; "
+        "the actual pose usage is read from the loaded graph and applied to the "
+        "PyTorch reference too.",
+    )
+    parser.add_argument(
         "--onnx-anyview",
         type=str,
-        default="weights/da3_anyview_n3_644x490_giant-large-1.1.onnx",
-        help="Any-view ONNX path.",
+        default=None,
+        help="Any-view ONNX path (default: --use-extrinsics variant under weights/).",
     )
     parser.add_argument(
         "--onnx-metric",
@@ -349,6 +432,7 @@ def main() -> None:
     args = parse_args()
     if not torch.cuda.is_available():
         raise SystemExit("[ERROR] CUDA is required for this comparison.")
+    onnx_anyview = args.onnx_anyview or DEFAULT_ANYVIEW_ONNX[args.use_extrinsics]
     # Preserve a stable run order (cheapest first) regardless of arg order.
     modules = [m for m in ALL_MODULES if m in args.modules]
 
@@ -365,10 +449,10 @@ def main() -> None:
         compare_metric(args.onnx_metric, api_model, images[0], ixts[0])
 
     if "anyview" in modules:
-        compare_anyview(args.onnx_anyview, api_model, images, exts, ixts)
+        compare_anyview(onnx_anyview, api_model, images, exts, ixts)
 
     if "nested" in modules:
-        compare_nested(args.onnx_anyview, args.onnx_metric, api_model, images, exts, ixts)
+        compare_nested(onnx_anyview, args.onnx_metric, api_model, images, exts, ixts)
 
 
 if __name__ == "__main__":

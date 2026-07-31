@@ -11,8 +11,8 @@ from __future__ import annotations
 import cv2
 import numpy as np
 import torch
-
-from model.alignment import align_anyview_with_metric, align_to_input_ext_scale
+from tools.utils.alignment import (align_anyview_with_metric,
+                                   align_to_input_ext_scale)
 
 
 class BaseDA3Model:
@@ -143,6 +143,47 @@ class BaseDA3Model:
         median_dist = max(float(np.median(dists)), 1e-1)
         ex_t_norm[..., :3, 3] /= median_dist
         return ex_t_norm
+
+    # ---- any-view input assembly -------------------------------------------
+
+    @property
+    def uses_extrinsics(self) -> bool:
+        """True if the loaded graph declares an ``extrinsics`` input.
+
+        Distinguishes the "with-camera-pose" any-view export (inputs
+        ``image``/``extrinsics``/``intrinsics``) from the default export
+        (``image`` only, the model predicts its own poses).  Reads the backend's
+        ``self.inputs`` metadata so feeding is driven by the actual model, never a
+        caller-supplied flag.
+        """
+        return any(i["name"] == "extrinsics" for i in getattr(self, "inputs", []))
+
+    def build_anyview_feed(
+        self,
+        img_batch: np.ndarray,
+        extrs: np.ndarray | None,
+        intrs_adj: np.ndarray,
+        *,
+        normalize_extrinsics: bool = False,
+    ) -> dict[str, np.ndarray]:
+        """Assemble the any-view input feed for the loaded graph.
+
+        Always includes ``image``; adds ``extrinsics``/``intrinsics`` only when the
+        graph declares them (see :attr:`uses_extrinsics`).  ``extrs`` may be
+        ``None`` for a default (pose-predicting) export.  Extrinsics are normalized
+        here only when ``normalize_extrinsics=True`` (the graph does not normalize).
+        """
+        feed: dict[str, np.ndarray] = {"image": img_batch.astype(np.float32)}
+        if self.uses_extrinsics:
+            if extrs is None:
+                raise ValueError(
+                    "This any-view model was exported with --use-extrinsics and "
+                    "requires camera extrinsics/intrinsics, but none were provided."
+                )
+            ext = self.normalize_extrinsics(extrs) if normalize_extrinsics else extrs
+            feed["extrinsics"] = ext[None].astype(np.float32)
+            feed["intrinsics"] = intrs_adj[None].astype(np.float32)
+        return feed
 
     # ---- output-name resolvers ---------------------------------------------
 
