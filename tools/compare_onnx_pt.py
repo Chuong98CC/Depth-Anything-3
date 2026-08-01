@@ -27,7 +27,7 @@ import gc
 import numpy as np
 import torch
 
-from tools.utils.astribot_dataloader import load_images_cam_params
+from tools.utils.astribot_dataloader import camera_set_for_views, load_images_cam_params
 from tools.export_onnx import EXPORT_REF_VIEW_STRATEGY
 from depth_anything_3.api import DepthAnything3
 from model.base_da3 import BaseDA3Model
@@ -160,6 +160,22 @@ def _cuda_gc() -> None:
     torch.cuda.empty_cache()
 
 
+def _num_views_from_onnx(onnx_path: str) -> int | None:
+    """Read the fixed view count N from an any-view ONNX input shape (B, N, 3, H, W).
+
+    Loads graph metadata only (no external weights), so it's cheap enough to size
+    the camera set before building the heavy inference sessions.
+    """
+    import onnx  # noqa: PLC0415
+
+    model = onnx.load(onnx_path, load_external_data=False)
+    dims = model.graph.input[0].type.tensor_type.shape.dim
+    if len(dims) == 5:  # (B, N, 3, H, W) — any-view
+        n = dims[1].dim_value
+        return n if n > 0 else None
+    return None
+
+
 def _check_view_count(model_views: int | None, n_images: int, what: str) -> None:
     """Fail early if the camera set's view count doesn't match the fixed export."""
     if model_views is not None and n_images != model_views:
@@ -231,6 +247,7 @@ def _pt_nested(
     exts: np.ndarray,
     metas: list[dict],
     use_extrinsics: bool = True,
+    align_scale: bool = True,
 ) -> dict[str, np.ndarray]:
     """Full nested model (any-view + metric + alignment), cropped to the tile.
 
@@ -265,7 +282,7 @@ def _pt_nested(
     # Skipped without camera pose so the predicted poses are compared directly,
     # exactly as DA3NestedONNX does when extrs is None.
     if use_extrinsics:
-        result = _BASE.align_to_input(result, exts, intrs_adj)
+        result = _BASE.align_to_input(result, exts, intrs_adj, align_scale=align_scale)
 
     # Crop padded depth/conf to the tile and un-pad the intrinsics (mirrors
     # DA3NestedONNX._crop_result).
@@ -351,23 +368,27 @@ def compare_nested(
     images: list[str],
     exts: np.ndarray,
     ixts: np.ndarray,
+    align_scale: bool = True,
 ) -> None:
     """Full nested pipeline PyTorch vs ONNX (any-view + metric + alignment)."""
     onnx = DA3NestedONNX(onnx_anyview, onnx_metric, "cuda")
     _check_view_count(onnx.av.num_views, len(images), "nested any-view")
     # Match the PyTorch any-view branch to the loaded graph's pose usage.
     use_ext = onnx.av.uses_extrinsics
-    print(f"[COMPARE] nested any-view uses camera pose: {use_ext}")
+    print(f"[COMPARE] nested any-view uses camera pose: {use_ext}  align_scale={align_scale}")
     # Feed/align to input poses only in the with-camera-pose case; otherwise both
     # sides keep predicted poses (so the comparison actually exercises them).
     exts_in = exts if use_ext else None
     img_batch, intrs_adj, metas = onnx.av.preprocess_views(images, ixts)
-    onx = onnx.infer(images, exts_in, ixts, align_input_ext_scale=True)
+    onx = onnx.infer(images, exts_in, ixts, align_input_ext_scale=True, align_scale=align_scale)
     del onnx
     _cuda_gc()
 
     api_model.to("cuda")
-    pt = _pt_nested(api_model, img_batch, intrs_adj, exts_in, metas, use_extrinsics=use_ext)
+    pt = _pt_nested(
+        api_model, img_batch, intrs_adj, exts_in, metas,
+        use_extrinsics=use_ext, align_scale=align_scale,
+    )
     api_model.to("cpu")
     _cuda_gc()
 
@@ -420,11 +441,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--camera-set",
-        default="set1",
+        default=None,
         choices=["set0", "set1", "set2"],
-        help="Astribot camera set (view count must match the any-view export).",
+        help="Astribot camera set (view count must match the any-view export). "
+        "Default: auto-selected from the any-view ONNX model's view count.",
     )
     parser.add_argument("--frame-idx", type=int, default=0, help="Frame index to load (0-based).")
+    parser.add_argument(
+        "--keep-predicted-pose",
+        dest="align_scale",
+        action="store_false",
+        help="Nested with camera pose: keep predicted poses aligned into the input "
+        "frame (align_scale=False) instead of replacing them with the input poses "
+        "and rescaling depth. Applied to both the ONNX and PyTorch sides.",
+    )
+    parser.set_defaults(align_scale=True)
     return parser.parse_args()
 
 
@@ -436,8 +467,18 @@ def main() -> None:
     # Preserve a stable run order (cheapest first) regardless of arg order.
     modules = [m for m in ALL_MODULES if m in args.modules]
 
-    print(f"[DATA] Loading Astribot {args.camera_set} / frame {args.frame_idx} ...")
-    images, exts, ixts = load_images_cam_params(args.camera_set, frame_idx=args.frame_idx)
+    # Resolve camera set: honour --camera-set, else match the any-view model views.
+    if args.camera_set is not None:
+        camera_set = args.camera_set
+    elif any(m in ("anyview", "nested") for m in modules):
+        nv = _num_views_from_onnx(onnx_anyview)
+        camera_set = camera_set_for_views(nv) if nv else "set1"
+        print(f"[DATA] Auto-selected --camera-set {camera_set} for {nv} views.")
+    else:
+        camera_set = "set1"  # metric only needs one view
+
+    print(f"[DATA] Loading Astribot {camera_set} / frame {args.frame_idx} ...")
+    images, exts, ixts = load_images_cam_params(camera_set, frame_idx=args.frame_idx)
     print(f"[DATA] {len(images)} views loaded")
 
     # Load the PyTorch reference once; kept on CPU except during its own forward.
@@ -452,7 +493,10 @@ def main() -> None:
         compare_anyview(onnx_anyview, api_model, images, exts, ixts)
 
     if "nested" in modules:
-        compare_nested(onnx_anyview, args.onnx_metric, api_model, images, exts, ixts)
+        compare_nested(
+            onnx_anyview, args.onnx_metric, api_model, images, exts, ixts,
+            align_scale=args.align_scale,
+        )
 
 
 if __name__ == "__main__":

@@ -42,12 +42,18 @@ class DA3NestedTRT(BaseDA3Model):
         intrs: np.ndarray,
         *,
         align_input_ext_scale: bool = True,
+        align_scale: bool = True,
     ) -> dict:
         """Run the full nested pipeline; returns cropped numpy outputs.
 
         When ``extrs is None`` (no camera pose) the model predicts its own poses
         and the Umeyama input-pose alignment is skipped — the output keeps the
         predicted poses, mirroring ``DepthAnything3.inference(extrinsics=None)``.
+
+        ``align_scale`` (only when input poses are aligned) selects, per
+        ``DepthAnything3.inference``: ``True`` replaces the output poses with the
+        input poses and rescales depth; ``False`` keeps the predicted poses aligned
+        into the input frame and leaves depth in the predicted metric scale.
         """
         n = len(imgs)
         if self.av.num_views is not None and n != self.av.num_views:
@@ -78,7 +84,7 @@ class DA3NestedTRT(BaseDA3Model):
         # Skipped without input poses — matches DepthAnything3.inference, which
         # returns predicted poses when extrinsics is None.
         if align_input_ext_scale and extrs is not None:
-            result = self.align_to_input(result, extrs, intrs_adj)
+            result = self.align_to_input(result, extrs, intrs_adj, align_scale=align_scale)
 
         # 5. Crop padded outputs to the tile; un-pad intrinsics
         return self._crop_result(result, metas)
@@ -149,12 +155,18 @@ class DA3NestedONNX(BaseDA3Model):
         intrs: np.ndarray,
         *,
         align_input_ext_scale: bool = True,
+        align_scale: bool = True,
     ) -> dict[str, np.ndarray]:
         """Run the full nested pipeline; returns cropped numpy depth/conf/extrinsics/intrinsics.
 
         When ``extrs is None`` (no camera pose) the model predicts its own poses
         and the Umeyama input-pose alignment is skipped — the output keeps the
         predicted poses, mirroring ``DepthAnything3.inference(extrinsics=None)``.
+
+        ``align_scale`` (only when input poses are aligned) selects, per
+        ``DepthAnything3.inference``: ``True`` replaces the output poses with the
+        input poses and rescales depth; ``False`` keeps the predicted poses aligned
+        into the input frame and leaves depth in the predicted metric scale.
         """
         n = len(imgs)
         if self.av.num_views is not None and n != self.av.num_views:
@@ -185,7 +197,7 @@ class DA3NestedONNX(BaseDA3Model):
         # Skipped without input poses — matches DepthAnything3.inference, which
         # returns predicted poses when extrinsics is None.
         if align_input_ext_scale and extrs is not None:
-            result = self.align_to_input(result, extrs, intrs_adj)
+            result = self.align_to_input(result, extrs, intrs_adj, align_scale=align_scale)
 
         # 5. Crop padded outputs back to the tile region; un-pad intrinsics
         return self._crop_result(result, metas)

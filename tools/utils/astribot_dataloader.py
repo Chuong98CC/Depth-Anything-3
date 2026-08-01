@@ -9,7 +9,7 @@ import cv2
 # Paths relative to repo root
 # ---------------------------------------------------------------------------
 DATA_ROOT = Path("/home/chuong/workspace/demo_data")
-CALIB_PATH = DATA_ROOT / "astribot_camera_calib_params" / "astribot_calibration_full_640x480.json"
+CALIB_PATH = DATA_ROOT / "astribot_camera_calib_params" / "astribot_calibration_full_640x480_da3.json"
 IMAGES_ROOT = DATA_ROOT / "astribot_stereo_lrb" / "images"
 # ---------------------------------------------------------------------------
 # Mapping: image directory suffix → calibration key
@@ -31,6 +31,21 @@ CAMERA_SETS: dict[str, list[str]] = {
     "set1": ["head_rgbd", "head_stereo_left", "head_stereo_right"],
     "set2": ["head_rgbd", "head_stereo_left", "head_stereo_right", "torso_rgbd"],
 }
+
+
+def camera_set_for_views(num_views: int) -> str:
+    """Return the camera set whose view count matches ``num_views``.
+
+    Data-driven from :data:`CAMERA_SETS` (set0=2, set1=3, set2=4), so a model
+    exported for *N* views can auto-select the matching Astribot data.
+    """
+    for name, cams in CAMERA_SETS.items():
+        if len(cams) == num_views:
+            return name
+    available = {name: len(cams) for name, cams in CAMERA_SETS.items()}
+    raise ValueError(
+        f"No Astribot camera set has {num_views} views; available: {available}."
+    )
 
 def _scale_intrinsics_matrix(
     matrix: list[float],

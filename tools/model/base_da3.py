@@ -285,17 +285,24 @@ class BaseDA3Model:
         result: dict,
         input_extrinsics: np.ndarray,
         input_intrinsics: np.ndarray,
+        align_scale: bool = True,
     ) -> dict:
         """Umeyama-align the prediction to the input camera poses (in place-ish).
 
-        Mirrors ``DepthAnything3.inference(align_to_input_ext_scale=True)``.
+        ``align_scale`` mirrors ``DepthAnything3.inference``'s
+        ``align_to_input_ext_scale``:
+
+        - ``True`` (default): replace the output poses with the raw input poses and
+          divide depth by the Umeyama scale (output is in the input-pose scale).
+        - ``False``: keep the **predicted** poses, only rigidly aligned into the
+          input frame (Umeyama rotation + translation), and leave depth unchanged.
         """
         aligned = align_to_input_ext_scale(
             pred_depth=result["depth"],
             pred_extrinsics=result["extrinsics"],
             input_extrinsics=input_extrinsics,
             input_intrinsics=input_intrinsics,
-            align_scale=True,
+            align_scale=align_scale,
         )
         result = dict(result)
         result["depth"] = aligned["depth"]

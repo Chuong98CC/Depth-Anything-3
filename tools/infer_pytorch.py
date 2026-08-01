@@ -22,6 +22,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import torch
@@ -40,8 +41,9 @@ def main():
         description="DepthAnything3 inference on Astribot stereo dataset",
     )
     parser.add_argument(
-        "--camera-set", choices=["set1", "set2"], default="set1",
-        help="Camera set: set1 = head_rgbd+stereo_left+stereo_right, "
+        "--camera-set", choices=["set0", "set1", "set2"], default="set1",
+        help="Camera set: set0 = stereo, "
+             "set1 = head_rgbd+stereo_left+stereo_right, "
              "set2 = set1+torso_rgbd (default: set1)",
     )
     parser.add_argument(
@@ -140,6 +142,34 @@ def main():
         print(f"  conf shape:     {prediction.conf.shape}")
     print(f"  extrinsics out: {prediction.extrinsics.shape}")
     print(f"  intrinsics out: {prediction.intrinsics.shape}")
+
+    camera_matrices = {
+        "camera_set": args.camera_set,
+        "frame_idx": frame_idx,
+        "images": images,
+        "input": {
+            "extrinsics": exts.tolist(),
+            "intrinsics": ixts.tolist(),
+        },
+        "output": {
+            "extrinsics": (
+                prediction.extrinsics.tolist()
+                if prediction.extrinsics is not None
+                else None
+            ),
+            "intrinsics": (
+                prediction.intrinsics.tolist()
+                if prediction.intrinsics is not None
+                else None
+            ),
+        },
+    }
+
+    camera_json_path = Path(export_dir or "output") / f"frame_{frame_idx:06d}_camera_matrices.json"
+    camera_json_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(camera_json_path, "w") as f:
+        json.dump(camera_matrices, f, indent=2)
+    print(f"  camera matrices: {camera_json_path}")
 
 
 if __name__ == "__main__":

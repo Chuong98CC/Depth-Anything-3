@@ -23,7 +23,7 @@ import gc
 
 import numpy as np
 
-from tools.utils.astribot_dataloader import load_images_cam_params
+from tools.utils.astribot_dataloader import camera_set_for_views, load_images_cam_params
 from model.da3anyview import DA3AnyViewTRT, DA3AnyViewONNX
 from model.da3metric import DA3MetricTRT, DA3MetricONNX
 from model.da3nested import DA3NestedTRT, DA3NestedONNX
@@ -199,6 +199,7 @@ def compare_nested(
     images: list[str],
     exts: np.ndarray,
     ixts: np.ndarray,
+    align_scale: bool = True,
 ) -> None:
     """Full nested pipeline ONNX vs TRT (any-view + metric + alignment)."""
     onnx = DA3NestedONNX(onnx_anyview, onnx_metric, "cuda")
@@ -209,12 +210,28 @@ def compare_nested(
     # Align to input poses only with a camera-pose model; otherwise keep predicted
     # poses (matches the no-extrinsics inference path).
     exts_in = exts if onnx.av.uses_extrinsics else None
-    o = onnx.infer(images, exts_in, ixts)
-    t = trt.infer(images, exts_in, ixts)
+    o = onnx.infer(images, exts_in, ixts, align_scale=align_scale)
+    t = trt.infer(images, exts_in, ixts, align_scale=align_scale)
     _compare(o, t, "NESTED  (ONNX vs TRT)", ["depth", "depth_conf", "extrinsics", "intrinsics"])
 
     del onnx, trt
     _cuda_gc()
+
+
+def _num_views_from_onnx(onnx_path: str) -> int | None:
+    """Read the fixed view count N from an any-view ONNX input shape (B, N, 3, H, W).
+
+    Loads graph metadata only (no external weights), so it's cheap enough to size
+    the camera set before building the heavy engines/sessions.
+    """
+    import onnx  # noqa: PLC0415
+
+    model = onnx.load(onnx_path, load_external_data=False)
+    dims = model.graph.input[0].type.tensor_type.shape.dim
+    if len(dims) == 5:  # (B, N, 3, H, W) — any-view
+        n = dims[1].dim_value
+        return n if n > 0 else None
+    return None
 
 
 def _check_view_count(model_views: int | None, n_images: int, what: str) -> None:
@@ -266,11 +283,21 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--camera-set",
-        default="set1",
+        default=None,
         choices=["set0", "set1", "set2"],
-        help="Astribot camera set (view count must match the any-view export).",
+        help="Astribot camera set (view count must match the any-view export). "
+        "Default: auto-selected from the any-view ONNX model's view count.",
     )
     parser.add_argument("--frame-idx", type=int, default=0, help="Frame index to load (0-based).")
+    parser.add_argument(
+        "--keep-predicted-pose",
+        dest="align_scale",
+        action="store_false",
+        help="Nested with camera pose: keep predicted poses aligned into the input "
+        "frame (align_scale=False) instead of replacing them with the input poses "
+        "and rescaling depth. Applied to both the ONNX and TRT sides.",
+    )
+    parser.set_defaults(align_scale=True)
     return parser.parse_args()
 
 
@@ -281,8 +308,18 @@ def main() -> None:
     # Preserve a stable run order (cheapest first) regardless of arg order.
     modules = [m for m in ALL_MODULES if m in args.modules]
 
-    print(f"[DATA] Loading Astribot {args.camera_set} / frame {args.frame_idx} ...")
-    images, exts, ixts = load_images_cam_params(args.camera_set, frame_idx=args.frame_idx)
+    # Resolve camera set: honour --camera-set, else match the any-view model views.
+    if args.camera_set is not None:
+        camera_set = args.camera_set
+    elif any(m in ("anyview", "nested") for m in modules):
+        nv = _num_views_from_onnx(onnx_anyview)
+        camera_set = camera_set_for_views(nv) if nv else "set1"
+        print(f"[DATA] Auto-selected --camera-set {camera_set} for {nv} views.")
+    else:
+        camera_set = "set1"  # metric only needs one view
+
+    print(f"[DATA] Loading Astribot {camera_set} / frame {args.frame_idx} ...")
+    images, exts, ixts = load_images_cam_params(camera_set, frame_idx=args.frame_idx)
     print(f"[DATA] {len(images)} views loaded")
 
     if "metric" in modules:
@@ -300,6 +337,7 @@ def main() -> None:
             images,
             exts,
             ixts,
+            align_scale=args.align_scale,
         )
 
 

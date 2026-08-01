@@ -154,6 +154,7 @@ Saves a `result.npz` per frame — cropped to each view's tile:
 | `--backend` | `onnx` | Inference backend: `onnx` or `trt` |
 | `--module` | `nested` | Module to run: `metric`, `anyview`, or `nested` |
 | `--use-extrinsics` | off | Any-view/nested: select the `-with-camera-pose` model and feed camera extrinsics/intrinsics as priors. Omit → plain model, poses predicted. |
+| `--keep-predicted-pose` | off | Nested + `--use-extrinsics`: keep the model's **predicted** poses rigidly aligned into the input frame (Umeyama R+t) and leave depth at the predicted metric scale, instead of replacing the output with the input poses and rescaling depth (`align_scale=False`). No effect without input poses. |
 | `--camera-set` | `set1` | `set0` (2 views), `set1` (3), or `set2` (4); must match the export |
 | `--frame` | `None` | Single frame index (use `--all-frames` for all) |
 | `--all-frames` | off | Process all frames common to the selected cameras |

@@ -36,7 +36,12 @@ import numpy as np
 _TOOLS_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(_TOOLS_DIR))
 
-from tools.utils.astribot_dataloader import CAMERA_SETS, count_frames, load_images_cam_params  # noqa: E402
+from tools.utils.astribot_dataloader import (  # noqa: E402
+    CAMERA_SETS,
+    camera_set_for_views,
+    count_frames,
+    load_images_cam_params,
+)
 from model.base_da3 import BaseDA3Model  # noqa: E402
 from model.da3anyview import DA3AnyViewONNX, DA3AnyViewTRT  # noqa: E402
 from model.da3metric import DA3MetricONNX, DA3MetricTRT  # noqa: E402
@@ -130,11 +135,16 @@ def run_module(
     exts: np.ndarray | None,
     ixts: np.ndarray,
     align_input_ext_scale: bool,
+    align_scale: bool = True,
 ) -> tuple[dict[str, np.ndarray], np.ndarray]:
     """Run the selected module on one frame.
 
     ``exts`` is ``None`` when running without camera pose; the model then predicts
     its own poses and the nested pipeline skips input-pose alignment.
+
+    ``align_scale`` (nested + input poses only) selects whether the output uses the
+    input poses with rescaled depth (``True``) or keeps the predicted poses aligned
+    into the input frame with unscaled depth (``False``).
 
     Returns ``(result, images_u8)`` — cropped numpy outputs plus the cropped,
     de-normalized RGB views (for visualization).
@@ -143,7 +153,11 @@ def run_module(
     images_u8 = _processed_images(img_batch, metas)
 
     if module == "nested":
-        result = model.infer(images, exts, ixts, align_input_ext_scale=align_input_ext_scale)
+        result = model.infer(
+            images, exts, ixts,
+            align_input_ext_scale=align_input_ext_scale,
+            align_scale=align_scale,
+        )
     elif module == "anyview":
         bundle = model.infer(images, exts, ixts)  # padded (1, N, …)
         result = _crop_bundle(bundle, metas)
@@ -178,8 +192,9 @@ def main() -> None:
     parser.add_argument(
         "--camera-set",
         choices=["set0", "set1", "set2"],
-        default="set1",
-        help="set0 = (stereo), set1 = 3 views (head_rgbd + stereo L/R), set2 = 4 views.",
+        default=None,
+        help="set0 = (stereo), set1 = 3 views (head_rgbd + stereo L/R), set2 = 4 views. "
+        "Default: auto-selected to match the loaded model's view count (metric → set1).",
     )
     parser.add_argument(
         "--frame",
@@ -233,6 +248,18 @@ def main() -> None:
     )
     parser.set_defaults(align_input_ext_scale=True)
     parser.add_argument(
+        "--keep-predicted-pose",
+        dest="align_scale",
+        action="store_false",
+        help="Nested + --use-extrinsics only: instead of replacing the output poses "
+        "with the input poses (and rescaling depth to the input-pose scale), keep "
+        "the model's PREDICTED poses rigidly aligned into the input frame (Umeyama "
+        "rotation+translation) and leave depth at the predicted metric scale "
+        "(align_scale=False). No effect without input poses or with "
+        "--no-align-input-ext-scale.",
+    )
+    parser.set_defaults(align_scale=True)
+    parser.add_argument(
         "--visualize",
         action="store_true",
         help="Save colour-coded depth maps (alongside the images) and, for "
@@ -248,10 +275,26 @@ def main() -> None:
     anyview_path = args.anyview_model or default_anyview_path(args.backend, args.use_extrinsics)
     metric_path = args.metric_model or DEFAULT_METRIC[args.backend]
 
+    # --- Build the selected model (first, so the camera set can match its views) ---
+    print(f"[MODEL] backend={args.backend} module={args.module}")
+    model = build_model(args.backend, args.module, anyview_path, metric_path, args.device)
+
+    # --- Resolve camera set ---
+    # Default: auto-select the set whose view count matches the model (metric is
+    # single-view, so it falls back to set1). An explicit --camera-set is honoured.
+    n_expected = _expected_views(model, args.module)
+    if args.camera_set is not None:
+        camera_set_name = args.camera_set
+    elif n_expected is not None:
+        camera_set_name = camera_set_for_views(n_expected)
+        print(f"[DATA] Auto-selected --camera-set {camera_set_name} for {n_expected} views.")
+    else:
+        camera_set_name = "set1"
+    camera_names = CAMERA_SETS[camera_set_name]
+
     # --- Determine frame range ---
-    camera_set = CAMERA_SETS[args.camera_set]
     if args.all_frames:
-        frame_counts = {key: count_frames(key) for key in camera_set}
+        frame_counts = {key: count_frames(key) for key in camera_names}
         num_frames = min(frame_counts.values())
         if num_frames == 0:
             raise RuntimeError("No frames found.")
@@ -263,22 +306,17 @@ def main() -> None:
     else:
         parser.error("Specify --frame N or --all-frames.")
 
-    # --- Build the selected model ---
-    print(f"[MODEL] backend={args.backend} module={args.module}")
-    model = build_model(args.backend, args.module, anyview_path, metric_path, args.device)
-
     # --- Per-frame inference ---
     for frame_idx in frame_indices:
         print(f"\n--- Frame {frame_idx} ---")
-        images, exts, ixts = load_images_cam_params(args.camera_set, frame_idx)
+        images, exts, ixts = load_images_cam_params(camera_set_name, frame_idx)
         print(f"  Views: {len(images)}")
         for p in images:
             print(f"    {p}")
 
-        n_expected = _expected_views(model, args.module)
         if n_expected is not None and len(images) != n_expected:
             raise SystemExit(
-                f"[ERROR] Camera set '{args.camera_set}' provides {len(images)} views, "
+                f"[ERROR] Camera set '{camera_set_name}' provides {len(images)} views, "
                 f"but the {args.module} model was exported for {n_expected}. Pick a "
                 f"--camera-set with {n_expected} views (set0=2, set1=3, set2=4)."
             )
@@ -289,7 +327,8 @@ def main() -> None:
         # DepthAnything3.inference(extrinsics=None) used by infer_pytorch.py.
         exts_in = exts if args.use_extrinsics else None
         result, images_u8 = run_module(
-            model, args.module, images, exts_in, ixts, args.align_input_ext_scale
+            model, args.module, images, exts_in, ixts,
+            args.align_input_ext_scale, args.align_scale,
         )
 
         for key, val in result.items():

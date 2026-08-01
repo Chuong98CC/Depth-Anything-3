@@ -240,8 +240,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--check-accuracy",
         action="store_true",
-        help="After export, compare ONNX vs PyTorch outputs using Astribot "
-             "set1 / frame 0 (preprocessed at the exported --height/--width).",
+        help="After export, compare ONNX vs PyTorch outputs using the Astribot "
+             "camera set matching --num-views (set0=2, set1=3, set2=4) / frame 0 "
+             "(preprocessed at the exported --height/--width).",
     )
     return parser.parse_args()
 
@@ -540,11 +541,11 @@ def _validate_onnx(onnx_path: Path) -> None:
     _print_io_shapes(model)
 
 
-def _load_astribot_frame0() -> tuple[list[str], np.ndarray, np.ndarray]:
-    """Load Astribot set1 / frame 0 image paths, extrinsics, and intrinsics."""
+def _load_astribot_frame0(camera_set: str = "set1") -> tuple[list[str], np.ndarray, np.ndarray]:
+    """Load Astribot ``camera_set`` / frame 0 image paths, extrinsics, intrinsics."""
     from tools.utils.astribot_dataloader import load_images_cam_params  # noqa: PLC0415
 
-    return load_images_cam_params("set1", 0)
+    return load_images_cam_params(camera_set, 0)
 
 
 def _preprocess_views(
@@ -696,16 +697,19 @@ def run_anyview_accuracy_check(
 ) -> None:
     """Compare any-view ONNX outputs against PyTorch using real multi-view data.
 
-    Loads ``set1`` / frame 0 from the Astribot dataset, preprocesses at the
-    exported ``height``/``width`` for both backends, and reports per-output error
-    statistics.  When ``use_extrinsics`` is False the extrinsics/intrinsics priors
-    are not fed to either backend (the model predicts poses), matching the graph
-    exported without ``--use-extrinsics``.
+    Loads the Astribot camera set whose view count matches ``num_views`` (set0=2,
+    set1=3, set2=4) / frame 0, preprocesses at the exported ``height``/``width`` for
+    both backends, and reports per-output error statistics.  When ``use_extrinsics``
+    is False the extrinsics/intrinsics priors are not fed to either backend (the
+    model predicts poses), matching the graph exported without ``--use-extrinsics``.
     """
-    print("\n" + "=" * 72)
-    print("[ACCURACY] Loading Astribot set1 / frame 0 ...")
+    from tools.utils.astribot_dataloader import camera_set_for_views  # noqa: PLC0415
 
-    images, exts_np, ixts_np = _load_astribot_frame0()
+    camera_set = camera_set_for_views(num_views)
+    print("\n" + "=" * 72)
+    print(f"[ACCURACY] Loading Astribot {camera_set} / frame 0 ({num_views} views) ...")
+
+    images, exts_np, ixts_np = _load_astribot_frame0(camera_set)
     print(f"[ACCURACY] Loaded {len(images)} views")
     for p in images:
         print(f"  {p}")
